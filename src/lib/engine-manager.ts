@@ -43,6 +43,10 @@ const RTL_LANGUAGES = new Set(["ar", "ur", "he", "fa", "ps", "sd", "ug", "yi"]);
 const LIBRETRANSLATE_URL = (process.env.LIBRETRANSLATE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
 const LIBRETRANSLATE_API_KEY = process.env.LIBRETRANSLATE_API_KEY || "";
 
+// Circuit breakers: if a backend fails, skip it for subsequent calls in this process
+let libreTranslateAvailable = true;
+let myMemoryAvailable = true;
+
 // Translation memory helpers (per-user + shared testing data)
 async function getMemoryTranslation(
   userId: number | undefined,
@@ -338,6 +342,7 @@ function splitIntoNaturalChunks(text: string, maxLen = MAX_CHUNK_LENGTH): string
  * Returns null when unavailable or on failure, so callers can fall back.
  */
 async function translateViaLibreTranslate(trimmed: string, src: string, tgt: string): Promise<string | null> {
+  if (!libreTranslateAvailable) return null;
   try {
     const body: Record<string, unknown> = {
       q: trimmed,
@@ -363,6 +368,7 @@ async function translateViaLibreTranslate(trimmed: string, src: string, tgt: str
     }
     return null;
   } catch {
+    libreTranslateAvailable = false;
     return null;
   }
 }
@@ -411,6 +417,14 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
   }
 
   // 3. Query open-source translation memory (MyMemory)
+  if (!myMemoryAvailable) {
+    // Skip MyMemory, use fallback
+    const isRtl = RTL_LANGUAGES.has(tgt);
+    const fallback = isRtl ? `[${tgt.toUpperCase()}: ${trimmed}]` : `[${tgt.toUpperCase()}] ${trimmed}`;
+    IN_MEMORY_CACHE.set(cacheKey, fallback);
+    await saveMemoryTranslation(userId, trimmed, src, tgt, fallback, saveToShared ?? false);
+    return fallback;
+  }
   try {
     const encodedQuery = encodeURIComponent(trimmed);
     const langpair = `${src}|${tgt}`;
@@ -421,7 +435,7 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
       headers: {
         "User-Agent": "WebLingoOpenSourceEngine/1.0",
       },
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(1500),
       cache: "no-store",
     });
 
@@ -442,6 +456,7 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
     }
   } catch (err) {
     console.warn(`Translation memory query failed for "${trimmed.slice(0, 40)}":`, err);
+    myMemoryAvailable = false;
   }
 
   // 3. Fallback format if network was unreachable
@@ -527,8 +542,8 @@ export async function translateBatch(params: {
 
   const results: TranslationResultItem[] = new Array(texts.length);
 
-  // Process translations in parallel with controlled concurrency (10 at a time for speed)
-  const CONCURRENCY = 10;
+  // Process translations in parallel with controlled concurrency (20 at a time for speed)
+  const CONCURRENCY = 20;
   for (let i = 0; i < texts.length; i += CONCURRENCY) {
     const batch = texts.slice(i, i + CONCURRENCY);
     const batchResults = await Promise.all(

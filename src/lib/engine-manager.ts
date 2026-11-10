@@ -351,7 +351,7 @@ async function translateViaLibreTranslate(trimmed: string, src: string, tgt: str
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(3000),
       cache: "no-store",
     });
 
@@ -421,7 +421,7 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
       headers: {
         "User-Agent": "WebLingoOpenSourceEngine/1.0",
       },
-      signal: AbortSignal.timeout(4500),
+      signal: AbortSignal.timeout(2000),
       cache: "no-store",
     });
 
@@ -525,15 +525,25 @@ export async function translateBatch(params: {
   const tStart = performance.now();
   const isRtl = RTL_LANGUAGES.has(target_lang.toLowerCase());
 
-  const results: TranslationResultItem[] = [];
+  const results: TranslationResultItem[] = new Array(texts.length);
 
-  for (const text of texts) {
-    const res = await translateString(text, source_lang, target_lang, userId, saveToShared);
-    results.push({
-      original: text,
-      translated: res.translated,
-      cached: res.cached,
-    });
+  // Process translations in parallel with controlled concurrency (10 at a time for speed)
+  const CONCURRENCY = 10;
+  for (let i = 0; i < texts.length; i += CONCURRENCY) {
+    const batch = texts.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((text, idx) =>
+        translateString(text, source_lang, target_lang, userId, saveToShared).then(res => ({
+          index: i + idx,
+          original: text,
+          translated: res.translated,
+          cached: res.cached,
+        }))
+      )
+    );
+    for (const r of batchResults) {
+      results[r.index] = { original: r.original, translated: r.translated, cached: r.cached };
+    }
   }
 
   const durationMs = Math.round(performance.now() - tStart);

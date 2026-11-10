@@ -9,7 +9,7 @@
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
-# Serverless function timeout
+# Serverless function timeout (Netlify Pro: up to 26s, Free: 10s)
 [functions]
   node_bundler = "esbuild"
 

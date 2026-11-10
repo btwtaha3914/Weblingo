@@ -7,6 +7,7 @@ import { translateBatch } from "@/lib/engine-manager";
 import { getUserIdFromRequest } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 // Discover internal links from a page (same origin only)
 function discoverLinks(html: string, baseUrl: string): string[] {

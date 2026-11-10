@@ -7,6 +7,7 @@ import { translateBatch } from "@/lib/engine-manager";
 import { getUserIdFromRequest } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
@@ -126,41 +127,47 @@ export async function POST(request: Request) {
 
       const assignStatus = autoApprove ? "approved" : "draft";
 
-      for (let i = 0; i < storedStrings.length; i++) {
-        const item = storedStrings[i];
-        const res = batchResult.translations[i];
-        const transText = res ? res.translated : item.sourceText;
-
-        await db
-          .insert(translations)
-          .values({
-            stringId: item.id,
-            targetLanguage,
-            translatedText: transText,
-            status: assignStatus,
-            isReviewed: autoApprove,
-            reviewedAt: autoApprove ? new Date() : null,
-            modelVersion: batchResult.model_version || "auto-engine",
+      // Save translations in parallel (batch of 10)
+      const SAVE_BATCH = 10;
+      for (let i = 0; i < storedStrings.length; i += SAVE_BATCH) {
+        const batch = storedStrings.slice(i, i + SAVE_BATCH);
+        await Promise.all(
+          batch.map((item, idx) => {
+            const res = batchResult.translations[i + idx];
+            const transText = res ? res.translated : item.sourceText;
+            return db
+              .insert(translations)
+              .values({
+                stringId: item.id,
+                targetLanguage,
+                translatedText: transText,
+                status: assignStatus,
+                isReviewed: autoApprove,
+                reviewedAt: autoApprove ? new Date() : null,
+                modelVersion: batchResult.model_version || "auto-engine",
+              })
+              .onConflictDoUpdate({
+                target: [translations.stringId, translations.targetLanguage],
+                set: {
+                  translatedText: transText,
+                  status: assignStatus,
+                  isReviewed: autoApprove,
+                  reviewedAt: autoApprove ? new Date() : null,
+                  updatedAt: new Date(),
+                },
+              })
+              .then(() => {
+                translatedCount++;
+                translatedResults.push({
+                  stringId: item.id,
+                  sourceText: item.sourceText,
+                  translatedText: transText,
+                  status: assignStatus,
+                  contextHint: item.contextHint,
+                });
+              });
           })
-          .onConflictDoUpdate({
-            target: [translations.stringId, translations.targetLanguage],
-            set: {
-              translatedText: transText,
-              status: assignStatus,
-              isReviewed: autoApprove,
-              reviewedAt: autoApprove ? new Date() : null,
-              updatedAt: new Date(),
-            },
-          });
-
-        translatedCount++;
-        translatedResults.push({
-          stringId: item.id,
-          sourceText: item.sourceText,
-          translatedText: transText,
-          status: assignStatus,
-          contextHint: item.contextHint,
-        });
+        );
       }
 
       // Ensure the project includes this target language

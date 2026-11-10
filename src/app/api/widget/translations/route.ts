@@ -45,13 +45,13 @@ export async function GET(request: Request) {
       try {
         const originHost = new URL(origin).hostname.toLowerCase();
         const appHost = new URL(request.url).hostname.toLowerCase();
-        const allowedHosts = domains.map(d => d.domain.toLowerCase());
+        const allowedHosts = domains.map((d: { domain: string }) => d.domain.toLowerCase());
         const isSameOrigin = originHost === appHost;
         const isDev = process.env.NODE_ENV !== "production";
         const isAllowed =
           isSameOrigin ||
           isDev ||
-          allowedHosts.some(h => originHost === h || originHost.endsWith("." + h) || originHost === "localhost" || originHost === "127.0.0.1");
+          allowedHosts.some((h: string) => originHost === h || originHost.endsWith("." + h) || originHost === "localhost" || originHost === "127.0.0.1");
         if (!isAllowed) {
           return widgetError(`Domain '${originHost}' is not authorized for this project.`, 403);
         }

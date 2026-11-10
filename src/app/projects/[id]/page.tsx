@@ -104,7 +104,7 @@ export default async function ProjectWorkspacePage(props: {
                   name: project.name,
                   baseUrl: project.baseUrl,
                   targetLanguages: langs,
-                  allowedDomains: domains.map((domain) => domain.domain),
+                  allowedDomains: domains.map((domain: { domain: string }) => domain.domain),
                   isAutoPublish: project.isAutoPublish,
                 }}
               />
@@ -172,7 +172,7 @@ export default async function ProjectWorkspacePage(props: {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {projectPages.map((page) => (
+                  {projectPages.map((page: { id: number; title: string; urlPath: string; extractionStatus: string; translationStatus: string; stringCount: number; lastExtractedAt: string | null }) => (
                     <tr key={page.id} className="hover:bg-slate-50/60">
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{page.title}</td>
                       <td className="py-2.5 px-3 font-mono text-slate-500">{page.urlPath}</td>

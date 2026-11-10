@@ -105,7 +105,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, message: "No strings found to translate." });
       }
 
-      const textsToTranslate = allStrings.map(s => s.sourceText);
+      const textsToTranslate = allStrings.map((s: { sourceText: string }) => s.sourceText);
       const userId = getUserIdFromRequest(request);
       const batchResult = await translateBatch({
         source_lang: "en",

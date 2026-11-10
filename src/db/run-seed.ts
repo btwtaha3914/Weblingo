@@ -13,7 +13,7 @@ async function main() {
     console.error("Seeding failed with error:", err);
     process.exit(1);
   } finally {
-    await pool.end();
+    if (pool) await pool.end();
   }
 }
 

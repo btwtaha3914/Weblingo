@@ -116,7 +116,7 @@ async function main() {
     console.error("Failed to clear database:", err);
     process.exit(1);
   } finally {
-    await pool.end();
+    if (pool) await pool.end();
   }
 }
 

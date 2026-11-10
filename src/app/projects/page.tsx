@@ -19,7 +19,7 @@ export default async function ProjectsPage() {
 
   // Compute page and string counts for each project
   const projectStats = await Promise.all(
-    allProjects.map(async (p) => {
+    allProjects.map(async (p: { id: number; name: string; baseUrl: string; targetLanguages: string[] }) => {
       const [pagesCount] = await db
         .select({ count: sql<number>`count(*)::int` })
         .from(pages)

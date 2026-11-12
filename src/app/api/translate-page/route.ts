@@ -17,11 +17,6 @@ export async function POST(request: Request) {
     if (body.html && typeof body.html === "string" && body.html.length > 5 * 1024 * 1024) {
       return NextResponse.json({ error: "HTML content exceeds 5MB limit." }, { status: 400 });
     }
-
-    // Global timeout for Netlify (8s to leave buffer for response)
-    const GLOBAL_TIMEOUT = 8000;
-    let timedOut = false;
-    const timeoutId = setTimeout(() => { timedOut = true; }, GLOBAL_TIMEOUT);
     const {
       url,
       html,
@@ -128,41 +123,19 @@ export async function POST(request: Request) {
       const textsToTranslate = storedStrings.map((s) => s.sourceText);
       const userId = getUserIdFromRequest(request);
       // Translate with a timeout to prevent 502s
-      let batchResult: Awaited<ReturnType<typeof translateBatch>>;
-      try {
-        batchResult = await Promise.race([
-          translateBatch({
-            source_lang: "en",
-            target_lang: targetLanguage,
-            texts: textsToTranslate,
-            userId,
-            saveToShared: true,
-          }),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Translation timeout")), 6000)),
-        ]);
-      } catch (transErr) {
-        console.error("[translate-page] Translation timeout/error:", transErr);
-        // Return what we have so far
-        return NextResponse.json({
-          ok: true,
-          page: savedPage,
-          extractedCount: extraction.stringCount,
-          targetLanguage,
-          autoApproved: autoApprove,
-          translatedCount: 0,
-          partial: true,
-          strings: storedStrings,
-          isRtl: ["ar", "ur", "he", "fa"].includes(targetLanguage),
-          message: "Translation timed out. Strings were extracted but not translated. Try again or translate fewer pages.",
-        });
-      }
+      const batchResult = await translateBatch({
+        source_lang: "en",
+        target_lang: targetLanguage,
+        texts: textsToTranslate,
+        userId,
+        saveToShared: true,
+      });
 
       const assignStatus = autoApprove ? "approved" : "draft";
 
       // Save translations in parallel (batch of 10)
       const SAVE_BATCH = 10;
       for (let i = 0; i < storedStrings.length; i += SAVE_BATCH) {
-        if (timedOut) break;
         const batch = storedStrings.slice(i, i + SAVE_BATCH);
         await Promise.all(
           batch.map((item, idx) => {
@@ -237,7 +210,6 @@ export async function POST(request: Request) {
       targetLanguage,
       autoApproved: autoApprove,
       translatedCount,
-      partial: timedOut,
       strings: translatedResults.length > 0 ? translatedResults : storedStrings,
       isRtl: ["ar", "ur", "he", "fa"].includes(targetLanguage),
     });

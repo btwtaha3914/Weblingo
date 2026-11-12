@@ -43,9 +43,33 @@ const RTL_LANGUAGES = new Set(["ar", "ur", "he", "fa", "ps", "sd", "ug", "yi"]);
 const LIBRETRANSLATE_URL = (process.env.LIBRETRANSLATE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
 const LIBRETRANSLATE_API_KEY = process.env.LIBRETRANSLATE_API_KEY || "";
 
-// Circuit breakers: if a backend fails, skip it for subsequent calls in this process
+// Circuit breaker for LibreTranslate
 let libreTranslateAvailable = true;
-let myMemoryAvailable = true;
+let lastHealthCheck = 0;
+
+// Reset circuit breaker if LibreTranslate has been down for > 60s (allow retry)
+async function checkLibreTranslateHealth(): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastHealthCheck < 60000 && !libreTranslateAvailable) {
+    return false; // Still in cooldown
+  }
+  lastHealthCheck = now;
+  try {
+    const res = await fetch(`${LIBRETRANSLATE_URL}/languages`, {
+      signal: AbortSignal.timeout(3000),
+      cache: "no-store",
+    });
+    if (res.ok) {
+      libreTranslateAvailable = true;
+      return true;
+    }
+    libreTranslateAvailable = false;
+    return false;
+  } catch {
+    libreTranslateAvailable = false;
+    return false;
+  }
+}
 
 // Translation memory helpers (per-user + shared testing data)
 async function getMemoryTranslation(
@@ -342,7 +366,11 @@ function splitIntoNaturalChunks(text: string, maxLen = MAX_CHUNK_LENGTH): string
  * Returns null when unavailable or on failure, so callers can fall back.
  */
 async function translateViaLibreTranslate(trimmed: string, src: string, tgt: string): Promise<string | null> {
-  if (!libreTranslateAvailable) return null;
+  if (!libreTranslateAvailable) {
+    // Check if LibreTranslate has recovered
+    const available = await checkLibreTranslateHealth();
+    if (!available) return null;
+  }
   try {
     const body: Record<string, unknown> = {
       q: trimmed,
@@ -416,44 +444,8 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
     return libreResult;
   }
 
-  // Try MyMemory as fallback (circuit breaker protects against repeated failures)
-  if (myMemoryAvailable) {
-    try {
-      const encodedQuery = encodeURIComponent(trimmed);
-      const langpair = `${src}|${tgt}`;
-      const url = `https://api.mymemory.translated.net/get?q=${encodedQuery}&langpair=${langpair}`;
-
-      const res = await fetch(url, {
-        method: "GET",
-        headers: {
-          "User-Agent": "WebLingoOpenSourceEngine/1.0",
-        },
-        signal: AbortSignal.timeout(2000),
-        cache: "no-store",
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const rawText = data?.responseData?.translatedText;
-        if (rawText && typeof rawText === "string" && !rawText.startsWith("MYMEMORY WARNING")) {
-          const decoded = rawText
-            .replace(/&#39;/g, "'")
-            .replace(/&quot;/g, '"')
-            .replace(/&amp;/g, "&")
-            .replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">");
-          IN_MEMORY_CACHE.set(cacheKey, decoded);
-          await saveMemoryTranslation(userId, trimmed, src, tgt, decoded, saveToShared ?? false);
-          return decoded;
-        }
-      }
-    } catch (err) {
-      console.warn(`MyMemory query failed for "${trimmed.slice(0, 40)}":`, err);
-      myMemoryAvailable = false;
-    }
-  }
-
-  // Final fallback if both LibreTranslate and MyMemory failed
+  // MyMemory removed - using LibreTranslate + curated dict + fallback only
+  // Final fallback if LibreTranslate was unreachable
   const isRtl = RTL_LANGUAGES.has(tgt);
   const fallback = isRtl
     ? `[${tgt.toUpperCase()}: ${trimmed}]`

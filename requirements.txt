@@ -9,6 +9,8 @@ flask-limiter==2.6.3
 flask-swagger==0.2.14
 flask-swagger-ui==4.11.1
 requests==2.31.0
+werkzeug==2.3.8
+itsdangerous==2.1.2
 numpy>=1.24
 packaging==23.1
 polib==1.1.1

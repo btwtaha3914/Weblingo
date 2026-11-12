@@ -416,50 +416,44 @@ async function translateAtomicSegment(text: string, src: string, tgt: string, us
     return libreResult;
   }
 
-  // 3. Query open-source translation memory (MyMemory)
-  if (!myMemoryAvailable) {
-    // Skip MyMemory, use fallback
-    const isRtl = RTL_LANGUAGES.has(tgt);
-    const fallback = isRtl ? `[${tgt.toUpperCase()}: ${trimmed}]` : `[${tgt.toUpperCase()}] ${trimmed}`;
-    IN_MEMORY_CACHE.set(cacheKey, fallback);
-    await saveMemoryTranslation(userId, trimmed, src, tgt, fallback, saveToShared ?? false);
-    return fallback;
-  }
-  try {
-    const encodedQuery = encodeURIComponent(trimmed);
-    const langpair = `${src}|${tgt}`;
-    const url = `https://api.mymemory.translated.net/get?q=${encodedQuery}&langpair=${langpair}`;
+  // Try MyMemory as fallback (circuit breaker protects against repeated failures)
+  if (myMemoryAvailable) {
+    try {
+      const encodedQuery = encodeURIComponent(trimmed);
+      const langpair = `${src}|${tgt}`;
+      const url = `https://api.mymemory.translated.net/get?q=${encodedQuery}&langpair=${langpair}`;
 
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "User-Agent": "WebLingoOpenSourceEngine/1.0",
-      },
-      signal: AbortSignal.timeout(1500),
-      cache: "no-store",
-    });
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          "User-Agent": "WebLingoOpenSourceEngine/1.0",
+        },
+        signal: AbortSignal.timeout(2000),
+        cache: "no-store",
+      });
 
-    if (res.ok) {
-      const data = await res.json();
-      const rawText = data?.responseData?.translatedText;
-      if (rawText && typeof rawText === "string" && !rawText.startsWith("MYMEMORY WARNING")) {
-        const decoded = rawText
-          .replace(/&#39;/g, "'")
-          .replace(/&quot;/g, '"')
-          .replace(/&amp;/g, "&")
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">");
-        IN_MEMORY_CACHE.set(cacheKey, decoded);
-        await saveMemoryTranslation(userId, trimmed, src, tgt, decoded, saveToShared ?? false);
-        return decoded;
+      if (res.ok) {
+        const data = await res.json();
+        const rawText = data?.responseData?.translatedText;
+        if (rawText && typeof rawText === "string" && !rawText.startsWith("MYMEMORY WARNING")) {
+          const decoded = rawText
+            .replace(/&#39;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">");
+          IN_MEMORY_CACHE.set(cacheKey, decoded);
+          await saveMemoryTranslation(userId, trimmed, src, tgt, decoded, saveToShared ?? false);
+          return decoded;
+        }
       }
+    } catch (err) {
+      console.warn(`MyMemory query failed for "${trimmed.slice(0, 40)}":`, err);
+      myMemoryAvailable = false;
     }
-  } catch (err) {
-    console.warn(`Translation memory query failed for "${trimmed.slice(0, 40)}":`, err);
-    myMemoryAvailable = false;
   }
 
-  // 3. Fallback format if network was unreachable
+  // Final fallback if both LibreTranslate and MyMemory failed
   const isRtl = RTL_LANGUAGES.has(tgt);
   const fallback = isRtl
     ? `[${tgt.toUpperCase()}: ${trimmed}]`

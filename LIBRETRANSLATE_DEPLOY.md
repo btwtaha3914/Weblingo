@@ -50,8 +50,9 @@ sudo apt update && sudo apt install -y python3 python3-pip python3-venv
 python3 -m venv /opt/libretranslate-venv
 source /opt/libretranslate-venv/bin/activate
 
-# 3. Install LibreTranslate
+# 3. Install LibreTranslate (pin Flask version for compatibility)
 pip install libretranslate
+pip install flask==2.2.5 werkzeug==2.3.8 itsdangerous==2.1.2
 
 # 4. Download language models
 python3 -c "

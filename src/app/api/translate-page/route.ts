@@ -12,6 +12,11 @@ export const maxDuration = 60;
 export async function POST(request: Request) {
   try {
     const body = await request.json();
+
+    // Validate text length to prevent oversized requests
+    if (body.html && typeof body.html === "string" && body.html.length > 5 * 1024 * 1024) {
+      return NextResponse.json({ error: "HTML content exceeds 5MB limit." }, { status: 400 });
+    }
     const {
       url,
       html,

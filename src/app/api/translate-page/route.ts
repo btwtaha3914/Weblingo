@@ -208,6 +208,7 @@ export async function POST(request: Request) {
       isRtl: ["ar", "ur", "he", "fa"].includes(targetLanguage),
     });
   } catch (err) {
+    console.error("[translate-page] Error:", err);
     return NextResponse.json(
       { error: err instanceof Error ? err.message : String(err) },
       { status: 500 }

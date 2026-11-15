@@ -341,8 +341,8 @@ Full extract + translate + store pipeline.
 | `NODE_ENV` | `development` | Runtime mode |
 | `APP_URL` | `http://localhost:3000` | Internal app URL |
 | `NEXT_PUBLIC_APP_URL` | `http://192.168.0.229:3000` | **Public URL used in generated widget snippets** (must be reachable by end clients) |
-| `DATABASE_URL` | `postgresql://postgres:taha1234@localhost:5432/weblingo` | PostgreSQL connection string |
-| `JWT_SECRET` | `Complicated@77889900112233445566` | Signing key for session tokens |
+| `DATABASE_URL` | `postgresql://USER:PASSWORD@HOST:5432/weblingo` | PostgreSQL connection string |
+| `JWT_SECRET` | `32+ random characters (never commit the real value)` | Signing key for session tokens |
 | `SESSION_COOKIE_NAME` | `weblingo_session` | Cookie name |
 | `COOKIE_SECURE` | `false` | Set `true` in production (HTTPS) |
 | `TRANSLATION_ENGINE_URL` | `http://127.0.0.1:5005` | Optional external Python engine |

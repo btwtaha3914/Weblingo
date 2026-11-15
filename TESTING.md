@@ -1,65 +1,78 @@
-# WebLingo — Testing Log and Verification Suite
+# Testing report — 2026-11-15
 
-## Phase 0: Feasibility Log
-- Test 001: Environment specs verified (Debian 12, Node.js 22, Python 3.11, PostgreSQL 15).
-- Test 002: Argos repository inspected (100 packages, 49 English source pairs).
-- Status: PASS
+Environment: local dev server (Next.js 16, Windows), local PostgreSQL,
+LibreTranslate at `http://117.102.7.15:8089` (50 languages, no API key).
+The widget was tested in Chromium (desktop and 375×812 mobile emulation) on
+the fixture site served from a different origin (`localhost:8090`) than WebLingo
+(`localhost:3000`).
 
----
+## How to re-run
 
-## Phase 1: Translation Microservice Tests
-- Test 101: `GET /health` responding with `status: healthy` and `zero_paid_api: true`.
-- Test 102: Token authentication enforcement (`X-Engine-Secret`).
-- Test 103: Catalog discovery with RTL flags for Arabic (`ar`) and Urdu (`ur`).
-- Test 104: English to Spanish batch translation.
-- Test 105: English to Arabic RTL translation with native Arabic Unicode.
-- Test 106: English to Urdu RTL translation with native Nastaliq Unicode.
-- Test 107: Edge cases (empty array, identity, oversize).
-- Test 108: Mock provider test.
-- Status: PASS (8 / 8 tests passed)
+```bash
+npm run test:extract                       # 12 offline extractor tests
+node tests/integration.mjs                 # end-to-end API test, prints a project key
+node tests/serve-fixtures.mjs <projectKey> # then open http://localhost:8090/index.html
+```
 
----
+## Results
 
-## Phase 2: Application Foundation & Database Schema Tests
+| # | Scenario | Result | Evidence |
+| --- | --- | --- | --- |
+| 1 | Simple HTML website | PASS | Fixture `about.html`: 7 segments, all translated |
+| 2 | Large website | PASS (extraction) | en.wikipedia.org article: 1,239 unique / 1,737 items in 344 ms. Full translation of that page not run (≈5 min at measured LibreTranslate speed) |
+| 3 | Many paragraphs | PASS | demo `services.html`: 76 items, 70 unique, 67/67 translated to Urdu via the dashboard |
+| 4 | Nested elements | PASS | `<h1>… <strong>grow</strong> …</h1>` and links inside paragraphs translated with markup kept (unit test + browser) |
+| 5 | Navigation and footer | PASS | Nav links split into one segment each; footer translated |
+| 6 | Forms and buttons | PASS | Labels, `placeholder`, submit `value`, buttons translated in the browser |
+| 7 | Unicode text | PASS | `café, naïve, 東京, “quotes” &amp;` round-trips; widget SHA-256 equals WebCrypto SHA-256 |
+| 8 | Spanish | PASS | 29/29 + 3/3 strings, widget switch verified |
+| 9 | French | PASS | 29/29 + 3/3, switched via the UI |
+| 10 | Urdu | PASS | 29/29 + 3/3; RTL applied |
+| 11 | Arabic | PASS | 29/29 + 3/3; `dir="rtl"`, `lang="ar"` set and removed again on English |
+| 12 | Dynamically added elements | PASS | Text added 1.5 s after load, and text added after switching, both translated (MutationObserver) |
+| 13 | Repeated text | PASS | Duplicates stored once (`occurrences` counted); about page reused 3–4 strings from index |
+| 14 | Translation failures | PASS (unit + code path) | Failed/markup-losing results are stored as `failed` with the original text, shown in red in the editor, never served to the widget. A real LibreTranslate outage was not simulated |
+| 15 | Invalid URL | PASS | 422 "Invalid URL format" |
+| 16 | Unreachable website | PASS | 422 "Unable to resolve website host …" |
+| 17 | Website blocking automated requests | PASS | zillow.com → 422 "refused automated access (HTTP 403)"; amazon.com bot page → 0 text, flagged as client-rendered |
+| 18 | Script on an external test website | PASS | Cross-origin fixture site: switcher appears, Shadow DOM keeps the host's `button{background:hotpink}` out, 33/33 page segments matched |
+| 19 | Script on multiple pages | PASS | Language chosen on index carried over to about.html (localStorage) |
+| 20 | Netlify production deployment | NOT RUN | Needs your Netlify account. `next build` succeeds locally; follow DEPLOYMENT.md and check `/api/health` |
 
-### Test 201: Drizzle Schema Migration Push
-- **Command:** `npx drizzle-kit push`
-- **Result:** Successfully created all 13 tables, foreign keys, unique indexes, and constraints in PostgreSQL:
-  - `users`, `projects`, `project_domains`, `supported_languages`, `pages`, `source_strings`, `page_strings`, `translations`, `translation_jobs`, `glossary_entries`, `installation_tokens`, `audit_events`, `usage_statistics`.
-- **Status:** PASS
+Additional checks:
 
-### Test 202: Portable MySQL/MariaDB Schema Generation
-- **Artifact:** `migrations/mysql_schema.sql`
-- **Result:** Generated valid MySQL syntax with utf8mb4 encoding, foreign keys, and indexes for cPanel compatibility.
-- **Status:** PASS
+| Check | Result |
+| --- | --- |
+| Several languages at once (API): one extraction, one job per language (de, zh, hi) | PASS, 3 languages in 8 s |
+| Several languages at once (dashboard): 7 languages selected on the demo contact page, per-language progress, result tabs | PASS, 7/7 languages complete, 0 failures |
+| More than 10 languages, or only the source language, rejected | PASS |
+| Project page pre-selects the project's languages; editor tabs follow project languages | PASS |
+| Restore to English leaves the DOM byte-identical to the original | PASS |
+| `translate="no"`, `.notranslate`, `<pre>`, comments untouched | PASS |
+| Keyboard: arrows/Home/End/Enter/Escape in the language menu | PASS |
+| Mobile 375 px: compact button, menu fits the screen | PASS |
+| SSRF: `169.254.169.254`, `192.168.1.1` blocked | PASS |
+| Widget API rejects an unauthorized `Origin` (403) | PASS |
+| `/api/widget/missing`: rejects `<script>` and number-only strings, 403 for foreign origins | PASS |
+| `/api/reset-database` without sign-in → 401 | PASS |
+| Unsupported language (`xx`) → 400 listing installed languages | PASS |
+| `npx tsc --noEmit`, `eslint`, `next build` | PASS |
 
-### Test 203: Database Seeding & Relation Integrity
-- **Command:** `node --env-file=.env node_modules/.bin/tsx src/db/run-seed.ts`
-- **Result:**
-  - 12 supported languages seeded.
-  - 1 demo user created with crypto.scrypt password hash (`demo12345`).
-  - 1 demo project ("Apex Global Technology") seeded with API key.
-  - 4 pages (`/`, `/about`, `/services`, `/contact`) created.
-  - 6 source strings with deterministic SHA-256 hashes created.
-  - 6 translations in Spanish, Arabic (RTL), and Urdu (RTL) seeded in `approved` and `draft` statuses.
-- **Status:** PASS
+## Measured performance
 
-### Test 204: Dashboard Query Aggregations
-- **Check:** `getDashboardOverview()` calculates real database aggregates with zero fake mock numbers.
-- **Result:**
-  - `totalProjects`: 1
-  - `totalPages`: 4
-  - `totalStrings`: 6
-  - `approvedTranslations`: 4
-  - `draftTranslations`: 2
-  - `untranslatedStrings`: 12
-  - `progressPercent`: 28%
-- **Status:** PASS
+LibreTranslate on this server: ~0.25–0.5 s per short segment, and **parallel
+requests do not increase throughput** (4×10 strings in parallel took the same
+22 s as sequential). WebLingo therefore sends one batch at a time and avoids
+re-translating anything already translated or in translation memory.
 
----
+| Run | Before | After |
+| --- | --- | --- |
+| Fixture site, 4 languages × 2 pages, cold | — | 39 s |
+| Same, translation memory warm | — | 7 s |
+| Old engine on Netlify | every string → `[ES] text` placeholder after the first 3 s timeout | real translations, each request < 10 s |
 
-## Final Validation Sequence
-- `npx next typegen` ➔ PASS
-- `npm exec tsc -- --noEmit` ➔ PASS (0 errors)
-- `npm run build` ➔ PASS
-- `build_and_start` ➔ PASS
+## Known quality limits (LibreTranslate, not WebLingo)
+
+Short UI labels can be translated literally (e.g. table cell "No" → French
+"Numéro"; brand "Northwind Studio" → Urdu "شمالی فن‌لینڈ"). Use `translate="no"`
+for brand names and fix individual strings in the translation editor.

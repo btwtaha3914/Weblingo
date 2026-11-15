@@ -2,8 +2,9 @@ import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { sourceStrings, translations, projects, auditEvents, pages, pageStrings } from "@/db/schema";
 import { eq, and, inArray } from "drizzle-orm";
-import { translateBatch } from "@/lib/engine-manager";
-import { getUserIdFromRequest } from "@/lib/auth";
+import { createJob } from "@/lib/pipeline";
+import { errorResponse, getAccessibleProject } from "@/lib/access";
+import { placeholdersMatch } from "@/lib/segments";
 
 export const dynamic = "force-dynamic";
 
@@ -65,7 +66,21 @@ export async function POST(request: Request) {
         );
       }
 
-      const assignedStatus = action === "approve" ? "approved" : (newStatus || "draft");
+      const allowedStatuses = ["draft", "approved", "rejected"];
+      const assignedStatus = action === "approve" ? "approved" : (allowedStatuses.includes(newStatus) ? newStatus : "draft");
+      if (typeof translatedText !== "string" || !translatedText.trim()) {
+        return NextResponse.json({ error: "Translation text cannot be empty." }, { status: 400 });
+      }
+
+      const [source] = await db.select().from(sourceStrings).where(eq(sourceStrings.id, Number(stringId)));
+      if (!source) return NextResponse.json({ error: "String not found." }, { status: 404 });
+      await getAccessibleProject(source.projectId, request);
+      if (!placeholdersMatch(source.sourceText, translatedText.trim())) {
+        return NextResponse.json(
+          { error: "Keep every <gN>…</gN> marker from the source text (they stand for links and formatting) and do not add HTML tags." },
+          { status: 400 }
+        );
+      }
 
       const [updated] = await db
         .insert(translations)
@@ -93,71 +108,15 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true, translation: updated });
     }
 
-    // Action 2: Batch translate all untranslated strings for a project and target language
+    // Action 2: queue a job that translates every untranslated string (run via POST /api/jobs/:id)
     if (action === "translate_all" && projectId && targetLanguage) {
-      const pId = Number(projectId);
-      const allStrings = await db
-        .select()
-        .from(sourceStrings)
-        .where(eq(sourceStrings.projectId, pId));
-
-      if (allStrings.length === 0) {
-        return NextResponse.json({ ok: true, message: "No strings found to translate." });
-      }
-
-      const textsToTranslate = allStrings.map((s: { sourceText: string }) => s.sourceText);
-      const userId = getUserIdFromRequest(request);
-      const batchResult = await translateBatch({
-        source_lang: "en",
-        target_lang: targetLanguage,
-        texts: textsToTranslate,
-        userId,
-        saveToShared: true,
-      });
-
-      // Store generated translations
-      for (let i = 0; i < allStrings.length; i++) {
-        const item = allStrings[i];
-        const transResult = batchResult.translations[i];
-        if (transResult) {
-          await db
-            .insert(translations)
-            .values({
-              stringId: item.id,
-              targetLanguage,
-              translatedText: transResult.translated,
-              status: "draft",
-              modelVersion: batchResult.model_version,
-            })
-            .onConflictDoUpdate({
-              target: [translations.stringId, translations.targetLanguage],
-              set: {
-                translatedText: transResult.translated,
-                updatedAt: new Date(),
-              },
-            });
-        }
-      }
-
-      await db.insert(auditEvents).values({
-        projectId: pId,
-        eventType: "batch_translation_completed",
-        details: { targetLanguage, count: allStrings.length, durationMs: batchResult.duration_ms },
-        ipAddress: "127.0.0.1",
-      });
-
-      return NextResponse.json({
-        ok: true,
-        count: allStrings.length,
-        duration_ms: batchResult.duration_ms,
-      });
+      const { project } = await getAccessibleProject(projectId, request);
+      const job = await createJob(project.id, String(targetLanguage), null);
+      return NextResponse.json({ ok: true, job: { id: job.id, status: job.status, total: job.totalStrings } });
     }
 
     return NextResponse.json({ error: "Invalid action specified." }, { status: 400 });
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : String(err) },
-      { status: 500 }
-    );
+    return errorResponse(err);
   }
 }

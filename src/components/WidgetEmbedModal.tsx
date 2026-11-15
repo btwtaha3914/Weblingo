@@ -1,8 +1,9 @@
 "use client";
 
 import React, { useState } from "react";
+import { buildEmbedSnippet, usePublicAppOrigin } from "@/lib/client-utils";
 
-export function WidgetEmbedModal({ apiKey = "wl_live_demo_key_77889900aabbccdd" }: { apiKey?: string }) {
+export function WidgetEmbedModal({ apiKey }: { apiKey: string }) {
   const [copied, setCopied] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>(["es", "fr", "de", "ar", "ur"]);
@@ -12,16 +13,8 @@ export function WidgetEmbedModal({ apiKey = "wl_live_demo_key_77889900aabbccdd" 
 
   // Use the public server URL (reachable by end clients) for the widget snippet.
   // Falls back to window.location.origin when NEXT_PUBLIC_APP_URL is not configured.
-  const origin =
-    (typeof process !== "undefined" &&
-      process.env.NEXT_PUBLIC_APP_URL &&
-      String(process.env.NEXT_PUBLIC_APP_URL).trim() !== ""
-      ? String(process.env.NEXT_PUBLIC_APP_URL).replace(/\/+$/, "")
-      : typeof window !== "undefined"
-        ? window.location.origin
-        : "https://YOUR-DOMAIN");
-  const langs = selected.length > 0 ? selected.join(",") : "es";
-  const snippet = `<!-- WebLingo Instant Website Translation Widget -->\n<script src="${origin}/widget.js" data-project-key="${apiKey}" data-api-url="${origin}" data-languages="${langs}" async></script>`;
+  const origin = usePublicAppOrigin();
+  const snippet = buildEmbedSnippet({ apiKey, languages: selected, defaultLanguage: "en", origin });
 
   const handleCopy = () => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {

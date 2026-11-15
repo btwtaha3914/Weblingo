@@ -1,36 +1,38 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
+/**
+ * CORS policy:
+ *  - /widget.js and /api/widget/* are public: any origin, no credentials.
+ *    (Domain authorization is enforced inside the widget routes.)
+ *  - Every other /api route is same-origin only: no CORS headers are added,
+ *    so other websites cannot call dashboard APIs from a visitor's browser.
+ */
+const PUBLIC_PREFIXES = ["/api/widget/", "/widget.js"];
+
 export function proxy(request: NextRequest) {
-  // Handle preflight requests for Private Network Access (PNA)
+  const path = request.nextUrl.pathname;
+  const isPublic = PUBLIC_PREFIXES.some((p) => path === p || path.startsWith(p));
+
+  if (!isPublic) {
+    if (request.method === "OPTIONS") return new NextResponse(null, { status: 204 });
+    return NextResponse.next();
+  }
+
+  const headers = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    // Lets pages on private networks load the widget in Chrome (Private Network Access).
+    "Access-Control-Allow-Private-Network": "true",
+    "Access-Control-Max-Age": "86400",
+  };
+
   if (request.method === "OPTIONS") {
-    const response = new NextResponse(null, { status: 204 });
-    const origin = request.headers.get("origin");
-    if (origin) {
-      response.headers.set("Access-Control-Allow-Origin", origin);
-    }
-    response.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    response.headers.set("Access-Control-Allow-Credentials", "true");
-    response.headers.set("Access-Control-Allow-Private-Network", "true");
-    response.headers.set("Access-Control-Max-Age", "86400");
-    return response;
+    return new NextResponse(null, { status: 204, headers });
   }
-
   const response = NextResponse.next();
-
-  // Add PNA and CORS headers to all responses
-  const origin = request.headers.get("origin");
-  if (origin) {
-    response.headers.set("Access-Control-Allow-Origin", origin);
-  } else {
-    response.headers.set("Access-Control-Allow-Origin", "*");
-  }
-  response.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  response.headers.set("Access-Control-Allow-Credentials", "true");
-  response.headers.set("Access-Control-Allow-Private-Network", "true");
-
+  for (const [k, v] of Object.entries(headers)) response.headers.set(k, v);
   return response;
 }
 

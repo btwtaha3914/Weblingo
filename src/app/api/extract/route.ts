@@ -1,105 +1,45 @@
 import { NextResponse } from "next/server";
-import { fetchAndExtractPage, extractTranslatableText, validateSafeUrl } from "@/lib/extractor";
-import { db } from "@/db";
-import { pages, sourceStrings, pageStrings, auditEvents } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { fetchAndExtractPage, extractTranslatableText } from "@/lib/extractor";
+import { errorResponse, getAccessibleProject, HttpError } from "@/lib/access";
+import { storeExtraction } from "@/lib/pipeline";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 26;
 
+/**
+ * Extracts translatable text from a URL (or pasted HTML).
+ * Body: { url | html, projectId?, saveToDatabase? }
+ */
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { url, html, projectId, saveToDatabase = false } = body;
+    const body = await request.json().catch(() => {
+      throw new HttpError(400, "Invalid JSON body.");
+    });
+    const { url, html, saveToDatabase = false } = body as { url?: unknown; html?: unknown; saveToDatabase?: boolean };
 
     let result;
-
-    if (html && typeof html === "string") {
-      result = extractTranslatableText(html, url || "https://custom-input.local");
-    } else if (url && typeof url === "string") {
-      const validation = await validateSafeUrl(url);
-      if (!validation.valid) {
-        return NextResponse.json({ error: validation.error }, { status: 400 });
+    if (typeof html === "string" && html.trim()) {
+      if (html.length > 5 * 1024 * 1024) throw new HttpError(400, "HTML content exceeds the 5 MB limit.");
+      result = extractTranslatableText(html, typeof url === "string" && url ? url : "https://pasted-html.invalid/");
+    } else if (typeof url === "string" && url.trim()) {
+      try {
+        result = await fetchAndExtractPage(url.trim());
+      } catch (err) {
+        throw new HttpError(422, err instanceof Error ? err.message : String(err));
       }
-      result = await fetchAndExtractPage(url);
     } else {
-      return NextResponse.json(
-        { error: "Please provide either a 'url' to fetch or raw 'html' to parse." },
-        { status: 400 }
-      );
+      throw new HttpError(400, "Please provide either a 'url' to fetch or raw 'html' to parse.");
     }
 
-    // Optionally persist into database if projectId is supplied
-    if (saveToDatabase && projectId) {
-      const pId = Number(projectId);
-
-      // Create or update page
-      const [savedPage] = await db
-        .insert(pages)
-        .values({
-          projectId: pId,
-          urlPath: result.url,
-          title: result.title,
-          extractionStatus: "extracted",
-          translationStatus: "untranslated",
-          stringCount: result.stringCount,
-          lastExtractedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [pages.projectId, pages.urlPath],
-          set: {
-            title: result.title,
-            stringCount: result.stringCount,
-            extractionStatus: "extracted",
-            lastExtractedAt: new Date(),
-          },
-        })
-        .returning();
-
-      // Store deduplicated strings
-      for (const item of result.strings) {
-        const [savedString] = await db
-          .insert(sourceStrings)
-          .values({
-            projectId: pId,
-            contentHash: item.contentHash,
-            sourceText: item.sourceText,
-            wordCount: item.wordCount,
-            contextHint: item.contextHint,
-          })
-          .onConflictDoUpdate({
-            target: [sourceStrings.projectId, sourceStrings.contentHash],
-            set: { contextHint: item.contextHint },
-          })
-          .returning();
-
-        // Link string to page
-        await db
-          .insert(pageStrings)
-          .values({
-            pageId: savedPage.id,
-            stringId: savedString.id,
-            domSelector: item.domSelector,
-            occurrenceIndex: item.occurrenceIndex,
-          })
-          .onConflictDoNothing();
-      }
-
-      await db.insert(auditEvents).values({
-        projectId: pId,
-        eventType: "page_extracted",
-        details: { url: result.url, extractedCount: result.stringCount },
-        ipAddress: "127.0.0.1",
-      });
+    let saved: { pageId: number; uniqueCount: number } | null = null;
+    if (saveToDatabase) {
+      const { project } = await getAccessibleProject(body.projectId, request);
+      const { page, strings } = await storeExtraction(project.id, result);
+      saved = { pageId: page.id, uniqueCount: strings.length };
     }
 
-    return NextResponse.json({
-      ok: true,
-      result,
-    });
+    return NextResponse.json({ ok: true, result, saved });
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : String(err) },
-      { status: 500 }
-    );
+    return errorResponse(err);
   }
 }

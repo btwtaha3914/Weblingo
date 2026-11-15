@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import { runJobToCompletion, skeletonToDisplay, RTL_CODES } from "@/lib/client-utils";
+import { languageInfo } from "@/lib/languages";
 
 interface StringTranslationRow {
   stringId: number;
@@ -15,8 +17,14 @@ interface StringTranslationRow {
   isReviewed: boolean | null;
 }
 
-export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
-  const [targetLang, setTargetLang] = useState("es");
+const DEFAULT_EDITOR_LANGUAGES = ["es", "ar", "ur", "fr", "de"];
+
+export function TranslationEditor({ projectId = 1, languages }: { projectId?: number; languages?: string[] }) {
+  const tabs = (languages && languages.length ? languages : DEFAULT_EDITOR_LANGUAGES).map((code) => {
+    const info = languageInfo(code);
+    return { code, name: info.rtl ? `${info.name} (RTL)` : info.name };
+  });
+  const [targetLang, setTargetLang] = useState(tabs[0]?.code || "es");
   const [rows, setRows] = useState<StringTranslationRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -75,43 +83,60 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
         }),
       });
 
-      if (res.ok) {
-        setNotification(approve ? "Translation updated and approved!" : "Saved.");
-        setTimeout(() => setNotification(null), 3000);
-        setEditingId(null);
-        fetchTranslations();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setNotification(data.error || "Could not save the translation.");
+        setTimeout(() => setNotification(null), 6000);
+        return;
       }
+      setNotification(approve ? "Translation updated and approved!" : "Saved.");
+      setTimeout(() => setNotification(null), 3000);
+      setEditingId(null);
+      fetchTranslations();
     } catch (err) {
       console.error("Save error:", err);
     }
   };
 
-  const handleTranslateAll = async () => {
+  /** Translates every untranslated string into one or several languages, one language at a time. */
+  const handleTranslateAll = async (langs: string[] = [targetLang]) => {
     setLoading(true);
     try {
-      const res = await fetch("/api/translations", {
+      const res = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "translate_all",
-          projectId,
-          targetLanguage: targetLang,
-        }),
+        body: JSON.stringify({ projectId, targetLanguages: langs }),
       });
       const data = await res.json();
-      if (data.ok) {
-        setNotification(`Translated ${data.count} strings into ${targetLang.toUpperCase()} (${data.duration_ms}ms)`);
-        setTimeout(() => setNotification(null), 4000);
-        fetchTranslations();
+      if (!res.ok) throw new Error(data.error || "Could not start translation.");
+      const summaries: string[] = [];
+      for (const j of data.jobs as { id: number; total: number; targetLanguage: string }[]) {
+        const name = languageInfo(j.targetLanguage).name;
+        if (j.total === 0) {
+          summaries.push(`${name}: already translated`);
+          continue;
+        }
+        const job = await runJobToCompletion(j.id, {
+          autoApprove: false,
+          onProgress: (s) =>
+            setNotification(`Translating ${name}… ${s.done} / ${s.total}${s.failed ? ` (${s.failed} failed)` : ""}`),
+        });
+        summaries.push(
+          `${name}: ${job.done}/${job.total}${job.failed ? `, ${job.failed} failed${job.lastError ? ` (${job.lastError})` : ""}` : ""}`
+        );
       }
+      setNotification(`Saved as drafts. ${summaries.join(" · ")}. Review and approve them to publish.`);
+      setTimeout(() => setNotification(null), 10000);
+      fetchTranslations();
     } catch (err) {
-      console.error("Auto translate error:", err);
+      setNotification(err instanceof Error ? err.message : String(err));
+      setTimeout(() => setNotification(null), 8000);
     } finally {
       setLoading(false);
     }
   };
 
-  const isRtl = ["ar", "ur"].includes(targetLang);
+  const isRtl = RTL_CODES.has(targetLang);
 
   const filteredRows = rows.filter(r =>
     r.sourceText.toLowerCase().includes(filter.toLowerCase()) ||
@@ -123,14 +148,8 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
       {/* Action Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-4">
         {/* Language Tabs */}
-        <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-xl">
-          {[
-            { code: "es", name: "Spanish" },
-            { code: "ar", name: "Arabic (RTL)" },
-            { code: "ur", name: "Urdu (RTL)" },
-            { code: "fr", name: "French" },
-            { code: "de", name: "German" },
-          ].map((l) => (
+        <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-100 rounded-xl">
+          {tabs.map((l) => (
             <button
               key={l.code}
               type="button"
@@ -147,7 +166,7 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
         </div>
 
         {/* Search & Batch Translate */}
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <input
             type="text"
             value={filter}
@@ -158,12 +177,22 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
 
           <button
             type="button"
-            onClick={handleTranslateAll}
+            onClick={() => handleTranslateAll([targetLang])}
             disabled={loading}
             className="px-3.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold text-xs rounded-lg transition-colors border border-blue-200 cursor-pointer disabled:opacity-50 whitespace-nowrap"
           >
-            Translate All to {targetLang.toUpperCase()}
+            Translate missing ({targetLang.toUpperCase()})
           </button>
+          {tabs.length > 1 && (
+            <button
+              type="button"
+              onClick={() => handleTranslateAll(tabs.map((t) => t.code))}
+              disabled={loading}
+              className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+            >
+              Translate missing (all {tabs.length} languages)
+            </button>
+          )}
         </div>
       </div>
 
@@ -195,7 +224,7 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
               {filteredRows.slice(0, 50).map((row) => (
                 <tr key={row.stringId} className="hover:bg-slate-50/60 transition-colors">
                   <td className="py-3 px-3 align-top leading-relaxed text-slate-800">
-                    <p className="font-medium">{row.sourceText}</p>
+                    <p className="font-medium">{skeletonToDisplay(row.sourceText)}</p>
                     {row.contextHint && (
                       <span className="inline-block mt-0.5 text-[10px] font-mono text-slate-400 uppercase">
                         {row.contextHint}
@@ -210,11 +239,16 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
                           dir={isRtl ? "rtl" : "ltr"}
                           value={editText}
                           onChange={(e) => setEditText(e.target.value)}
-                          rows={2}
+                          rows={3}
                           className={`w-full rounded-lg bg-slate-50 border border-blue-500 p-2 text-xs text-slate-900 focus:outline-none ${
                             isRtl ? "text-right font-medium" : ""
                           }`}
                         />
+                        {/<g\d+>/.test(row.sourceText) && (
+                          <p className="text-[10px] text-slate-500">
+                            Keep the &lt;g1&gt;…&lt;/g1&gt; markers around the words they wrap; they stand for links and formatting.
+                          </p>
+                        )}
                         <div className="flex items-center gap-1.5">
                           <button
                             type="button"
@@ -239,7 +273,11 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
                           isRtl ? "text-right font-medium text-sm" : ""
                         }`}
                       >
-                        {row.translatedText || (
+                        {row.status === "failed" ? (
+                          <span className="text-red-600 italic">Translation failed: the original text is shown on the site</span>
+                        ) : row.translatedText ? (
+                          skeletonToDisplay(row.translatedText)
+                        ) : (
                           <span className="text-slate-400 italic">Not translated</span>
                         )}
                       </div>
@@ -257,6 +295,10 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
                         <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
                         Draft
                       </span>
+                    ) : row.status === "failed" ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200">
+                        Failed
+                      </span>
                     ) : (
                       <span className="text-slate-400 text-[10px]">Pending</span>
                     )}
@@ -268,7 +310,7 @@ export function TranslationEditor({ projectId = 1 }: { projectId?: number }) {
                         type="button"
                         onClick={() => {
                           setEditingId(row.stringId);
-                          setEditText(row.translatedText || row.sourceText);
+                          setEditText(row.status !== "failed" && row.translatedText ? row.translatedText : row.sourceText);
                         }}
                         className="text-blue-600 hover:text-blue-800 font-semibold text-[11px] cursor-pointer"
                       >

@@ -1,223 +1,84 @@
 import { NextResponse } from "next/server";
-import { fetchAndExtractPage, extractTranslatableText, validateSafeUrl } from "@/lib/extractor";
+import { fetchAndExtractPage, extractTranslatableText } from "@/lib/extractor";
 import { db } from "@/db";
-import { pages, sourceStrings, pageStrings, translations, auditEvents, projects } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { translateBatch } from "@/lib/engine-manager";
-import { getUserIdFromRequest } from "@/lib/auth";
+import { auditEvents } from "@/db/schema";
+import { createJob, storeExtraction } from "@/lib/pipeline";
+import { errorResponse, getAccessibleProject, HttpError, parseLanguageList } from "@/lib/access";
+import { isRtlLanguage } from "@/lib/engine-manager";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 26;
 
+/**
+ * Step 1 of translating a page: fetch + extract + store, then create a
+ * translation job. The client then calls POST /api/jobs/:id until done.
+ *
+ * Body: { url | html, projectId, targetLanguages: string[] } (or a single targetLanguage)
+ * One job is created per language; the page is extracted only once.
+ */
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-
-    // Validate text length to prevent oversized requests
-    if (body.html && typeof body.html === "string" && body.html.length > 5 * 1024 * 1024) {
-      return NextResponse.json({ error: "HTML content exceeds 5MB limit." }, { status: 400 });
-    }
-    const {
-      url,
-      html,
-      projectId = 1,
-      targetLanguage = "es",
-      autoTranslate = true,
-      autoApprove = true,
-    } = body;
-
-    const pId = Number(projectId) || 1;
+    const body = await request.json().catch(() => {
+      throw new HttpError(400, "Invalid JSON body.");
+    });
+    const { url, html } = body as { url?: unknown; html?: unknown };
+    const { project, userId } = await getAccessibleProject(body.projectId, request);
+    const targetLanguages = parseLanguageList(body.targetLanguages ?? body.targetLanguage, project.sourceLanguage);
+    const targetLanguage = targetLanguages[0];
 
     let extraction;
-
-    if (html && typeof html === "string") {
-      extraction = extractTranslatableText(html, url || "https://custom-preview.local/page");
-    } else if (url && typeof url === "string") {
-      const validation = await validateSafeUrl(url);
-      if (!validation.valid) {
-        return NextResponse.json({ error: validation.error }, { status: 400 });
+    if (typeof html === "string" && html.trim()) {
+      if (html.length > 5 * 1024 * 1024) throw new HttpError(400, "HTML content exceeds the 5 MB limit.");
+      extraction = extractTranslatableText(html, typeof url === "string" && url ? url : "https://pasted-html.invalid/");
+    } else if (typeof url === "string" && url.trim()) {
+      try {
+        extraction = await fetchAndExtractPage(url.trim());
+      } catch (err) {
+        throw new HttpError(422, err instanceof Error ? err.message : String(err));
       }
-      extraction = await fetchAndExtractPage(url);
     } else {
-      return NextResponse.json(
-        { error: "Please enter a valid webpage URL or provide HTML markup." },
-        { status: 400 }
+      throw new HttpError(400, "Please enter a webpage URL.");
+    }
+
+    if (!extraction.strings.length) {
+      throw new HttpError(
+        422,
+        extraction.likelyClientRendered
+          ? "No text was found in the page HTML. This site appears to build its content with JavaScript in the browser; install the widget on it and visit the page so WebLingo can collect the text, then translate again."
+          : "No translatable text was found on this page."
       );
     }
 
-    if (!extraction.strings || extraction.strings.length === 0) {
-      return NextResponse.json(
-        { error: "No translatable text elements (headings, paragraphs, buttons) found on the provided page." },
-        { status: 400 }
-      );
+    const { page, strings } = await storeExtraction(project.id, extraction);
+    const jobs = [];
+    for (const lang of targetLanguages) {
+      const job = await createJob(project.id, lang, page.id);
+      jobs.push({ id: job.id, status: job.status, total: job.totalStrings, targetLanguage: lang, isRtl: isRtlLanguage(lang) });
     }
+    const job = jobs[0];
 
-    // 1. Save or update the page record
-    const [savedPage] = await db
-      .insert(pages)
-      .values({
-        projectId: pId,
-        urlPath: extraction.url,
-        title: extraction.title,
-        extractionStatus: "extracted",
-        translationStatus: autoTranslate ? "translated" : "untranslated",
-        stringCount: extraction.stringCount,
-        lastExtractedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: [pages.projectId, pages.urlPath],
-        set: {
-          title: extraction.title,
-          stringCount: extraction.stringCount,
-          extractionStatus: "extracted",
-          translationStatus: autoTranslate ? "translated" : "untranslated",
-          lastExtractedAt: new Date(),
-        },
-      })
-      .returning();
-
-    // 2. Insert or get source strings
-    const storedStrings: { id: number; contentHash: string; sourceText: string; contextHint: string | null }[] = [];
-
-    for (const item of extraction.strings) {
-      const [strRow] = await db
-        .insert(sourceStrings)
-        .values({
-          projectId: pId,
-          contentHash: item.contentHash,
-          sourceText: item.sourceText,
-          wordCount: item.wordCount,
-          contextHint: item.contextHint,
-        })
-        .onConflictDoUpdate({
-          target: [sourceStrings.projectId, sourceStrings.contentHash],
-          set: { contextHint: item.contextHint },
-        })
-        .returning();
-
-      storedStrings.push(strRow);
-
-      // Link to page
-      await db
-        .insert(pageStrings)
-        .values({
-          pageId: savedPage.id,
-          stringId: strRow.id,
-          domSelector: item.domSelector,
-          occurrenceIndex: item.occurrenceIndex,
-        })
-        .onConflictDoNothing();
-    }
-
-    // 3. Auto-translate into selected language if requested
-    let translatedCount = 0;
-    const translatedResults: {
-      stringId: number;
-      sourceText: string;
-      translatedText: string;
-      status: string;
-      contextHint: string | null;
-    }[] = [];
-
-    if (autoTranslate && targetLanguage) {
-      const textsToTranslate = storedStrings.map((s) => s.sourceText);
-      const userId = getUserIdFromRequest(request);
-      // Translate with a timeout to prevent 502s
-      const batchResult = await translateBatch({
-        source_lang: "en",
-        target_lang: targetLanguage,
-        texts: textsToTranslate,
-        userId,
-        saveToShared: true,
-      });
-
-      const assignStatus = autoApprove ? "approved" : "draft";
-
-      // Save translations in parallel (batch of 10)
-      const SAVE_BATCH = 10;
-      for (let i = 0; i < storedStrings.length; i += SAVE_BATCH) {
-        const batch = storedStrings.slice(i, i + SAVE_BATCH);
-        await Promise.all(
-          batch.map((item, idx) => {
-            const res = batchResult.translations[i + idx];
-            const transText = res ? res.translated : item.sourceText;
-            return db
-              .insert(translations)
-              .values({
-                stringId: item.id,
-                targetLanguage,
-                translatedText: transText,
-                status: assignStatus,
-                isReviewed: autoApprove,
-                reviewedAt: autoApprove ? new Date() : null,
-                modelVersion: batchResult.model_version || "auto-engine",
-              })
-              .onConflictDoUpdate({
-                target: [translations.stringId, translations.targetLanguage],
-                set: {
-                  translatedText: transText,
-                  status: assignStatus,
-                  isReviewed: autoApprove,
-                  reviewedAt: autoApprove ? new Date() : null,
-                  updatedAt: new Date(),
-                },
-              })
-              .then(() => {
-                translatedCount++;
-                translatedResults.push({
-                  stringId: item.id,
-                  sourceText: item.sourceText,
-                  translatedText: transText,
-                  status: assignStatus,
-                  contextHint: item.contextHint,
-                });
-              });
-          })
-        );
-      }
-
-      // Ensure the project includes this target language
-      const projectRow = await db.query.projects.findFirst({
-        where: eq(projects.id, pId),
-      });
-      if (projectRow) {
-        const currentLangs = (projectRow.targetLanguages as string[]) || [];
-        if (!currentLangs.includes(targetLanguage)) {
-          await db
-            .update(projects)
-            .set({ targetLanguages: [...currentLangs, targetLanguage] })
-            .where(eq(projects.id, pId));
-        }
-      }
-
-      await db.insert(auditEvents).values({
-        projectId: pId,
-        eventType: "page_auto_translated",
-        details: {
-          url: extraction.url,
-          targetLanguage,
-          count: translatedCount,
-          autoApproved: autoApprove,
-        },
-        ipAddress: "127.0.0.1",
-      });
-    }
+    await db.insert(auditEvents).values({
+      projectId: project.id,
+      userId: userId ?? null,
+      eventType: "page_extracted",
+      details: { url: page.urlPath, unique: strings.length, occurrences: extraction.totalOccurrences, targetLanguages },
+    });
 
     return NextResponse.json({
       ok: true,
-      page: savedPage,
-      extractedCount: extraction.stringCount,
+      page: { id: page.id, title: page.title, urlPath: page.urlPath },
+      extractedCount: extraction.totalOccurrences,
+      uniqueCount: strings.length,
+      alreadyTranslated: strings.length - job.total,
       targetLanguage,
-      autoApproved: autoApprove,
-      translatedCount,
-      strings: translatedResults.length > 0 ? translatedResults : storedStrings,
-      isRtl: ["ar", "ur", "he", "fa"].includes(targetLanguage),
+      targetLanguages,
+      isRtl: isRtlLanguage(targetLanguage),
+      likelyClientRendered: extraction.likelyClientRendered,
+      links: extraction.links.slice(0, 200),
+      job: { id: job.id, status: job.status, total: job.total },
+      jobs,
     });
   } catch (err) {
-    console.error("[translate-page] Error:", err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : String(err) },
-      { status: 500 }
-    );
+    return errorResponse(err);
   }
 }

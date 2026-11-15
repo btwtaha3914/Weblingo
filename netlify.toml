@@ -1,3 +1,17 @@
+# WebLingo on Netlify
+#
+# The Next.js app (dashboard + API route handlers) runs on Netlify through the
+# Next.js runtime: route handlers become serverless functions. LibreTranslate
+# does NOT run on Netlify; it runs on your own server (LIBRETRANSLATE_URL).
+#
+# Netlify stops synchronous functions after 10 s by default (26 s max on paid
+# plans). WebLingo never needs a long request: translation runs as a job that
+# the dashboard advances in ~7 s steps (JOB_STEP_BUDGET_MS), and each page is
+# extracted in its own request (EXTRACTION_TIMEOUT_MS, default 6 s).
+#
+# Set these in Site configuration → Environment variables (see README):
+#   DATABASE_URL, JWT_SECRET, LIBRETRANSLATE_URL, NEXT_PUBLIC_APP_URL
+
 [build]
   command = "npm run build"
   publish = ".next"
@@ -9,19 +23,27 @@
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
-# Serverless function timeout (Netlify Pro: up to 26s, Free: 10s)
 [functions]
   node_bundler = "esbuild"
 
-# Ensure dynamic routes are not statically cached
+# Dashboard APIs: never cache.
 [[headers]]
   for = "/api/*"
   [headers.values]
     Cache-Control = "no-store"
+    X-Content-Type-Options = "nosniff"
 
-# CORS headers for widget
+# The embeddable widget: cross-origin loadable, short cache so updates roll out quickly.
 [[headers]]
   for = "/widget.js"
   [headers.values]
     Access-Control-Allow-Origin = "*"
-    Cache-Control = "public, max-age=3600"
+    Cache-Control = "public, max-age=300, stale-while-revalidate=86400"
+    Content-Type = "application/javascript; charset=utf-8"
+    X-Content-Type-Options = "nosniff"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "SAMEORIGIN"
+    Referrer-Policy = "strict-origin-when-cross-origin"

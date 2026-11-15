@@ -53,6 +53,7 @@ export function TranslationPlayground() {
 
       const data = await res.json();
       if (data.translations && data.translations.length > 0) {
+        if (data.translations[0].ok === false) throw new Error(data.translations[0].error || "Translation failed");
         setTranslatedText(data.translations[0].translated);
         setIsRtl(Boolean(data.target_rtl));
         setDuration(data.duration_ms);

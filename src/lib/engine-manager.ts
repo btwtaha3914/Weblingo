@@ -1,22 +1,454 @@
 /**
- * WebLingo Autonomous Translation Engine
- * 100% in-process TypeScript engine running directly inside Next.js.
- * 
- * Features:
- * - Completely self-contained: zero external daemon processes to manage.
- * - Multi-paragraph and long-text chunking: seamlessly handles 5,000+ characters by
- *   splitting across paragraphs and natural sentence boundaries without truncation.
- * - Local high-accuracy translation dictionary for website UI and terminology.
- * - Open-source community translation memory integration (MyMemory Open TM API).
- * - Full Arabic & Urdu right-to-left (RTL) script detection and formatting.
- * - Memory caching for ultra-fast instant repeated lookups.
- * - Strict Zero Paid API Policy: absolutely NO Google, DeepL, or AWS API keys.
+ * WebLingo translation engine.
+ *
+ * Talks to a self-hosted LibreTranslate server (REST API, see
+ * https://github.com/LibreTranslate/LibreTranslate) configured with:
+ *   LIBRETRANSLATE_URL      e.g. http://117.102.7.15:8089   (required)
+ *   LIBRETRANSLATE_API_KEY  only when the server has api keys enabled
+ *
+ * Verified LibreTranslate API behaviour this module relies on:
+ *   GET  /languages            -> [{ code, name, targets: [...] }]
+ *   POST /translate {q: string[] , source, target, format: "text"|"html"}
+ *        -> { translatedText: string[] }   (array in, array out)
+ *   source may be "auto"       -> adds detectedLanguage to the response
+ *   format "html" keeps unknown tags such as <g1>..</g1>.
+ *
+ * Rules:
+ *   - A failed translation is NEVER replaced by a fake or empty string. The
+ *     caller receives { ok: false, error } and keeps the original text.
+ *   - Failures are never written to translation memory.
+ *   - LibreTranslate is CPU-bound (parallel requests do not raise throughput),
+ *     so batches are sent sequentially and sized to fit a time budget.
  */
+
+import { db } from "@/db";
+import { userTranslationMemory, sharedTranslationMemory } from "@/db/schema";
+import { and, eq, inArray } from "drizzle-orm";
+import { hashSourceText } from "./auth";
+import {
+  escapeSkeletonText,
+  placeholdersMatch,
+  skeletonHasPlaceholders,
+  unescapeSkeletonText,
+} from "./segments";
+
+const LT_URL = (process.env.LIBRETRANSLATE_URL || "").trim().replace(/\/+$/, "");
+const LT_API_KEY = (process.env.LIBRETRANSLATE_API_KEY || "").trim();
+const REQUEST_TIMEOUT_MS = Number(process.env.TRANSLATION_TIMEOUT_MS) || 15000;
+const MAX_BATCH_ITEMS = Number(process.env.TRANSLATION_MAX_BATCH_SIZE) || 25;
+const MAX_BATCH_CHARS = 2500;
+const MAX_RETRIES = 3;
+
+export const RTL_LANGUAGES = new Set(["ar", "ur", "he", "fa", "ps", "sd", "ug", "yi"]);
+
+export function isRtlLanguage(code: string): boolean {
+  return RTL_LANGUAGES.has(code.toLowerCase().split("-")[0]);
+}
+
+/** WebLingo/ISO code -> LibreTranslate code. */
+const LT_CODE_ALIASES: Record<string, string> = {
+  zh: "zh-Hans",
+  "zh-cn": "zh-Hans",
+  "zh-tw": "zh-Hant",
+  "pt-br": "pt-BR",
+  no: "nb",
+};
+
+export function toEngineCode(code: string): string {
+  const lower = code.trim().toLowerCase();
+  return LT_CODE_ALIASES[lower] || lower;
+}
+
+export class TranslationEngineError extends Error {
+  constructor(message: string, public readonly retryable: boolean) {
+    super(message);
+  }
+}
+
+export function isEngineConfigured(): boolean {
+  return LT_URL.length > 0;
+}
+
+function requireEngineUrl(): string {
+  if (!LT_URL) {
+    throw new TranslationEngineError(
+      "LIBRETRANSLATE_URL is not configured. Set it to your LibreTranslate server address.",
+      false
+    );
+  }
+  return LT_URL;
+}
+
+// ---------------------------------------------------------------------------
+// Supported languages (cached)
+// ---------------------------------------------------------------------------
+
+interface EngineLanguage {
+  code: string;
+  name: string;
+  targets: string[];
+}
+
+let languageCache: { at: number; languages: EngineLanguage[] } | null = null;
+const LANGUAGE_CACHE_MS = 10 * 60 * 1000;
+
+export async function getEngineLanguages(): Promise<EngineLanguage[]> {
+  if (languageCache && Date.now() - languageCache.at < LANGUAGE_CACHE_MS) {
+    return languageCache.languages;
+  }
+  const base = requireEngineUrl();
+  const res = await fetch(`${base}/languages`, {
+    signal: AbortSignal.timeout(5000),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new TranslationEngineError(`LibreTranslate /languages returned HTTP ${res.status}`, true);
+  }
+  const data = (await res.json()) as EngineLanguage[];
+  if (!Array.isArray(data)) {
+    throw new TranslationEngineError("LibreTranslate /languages returned an unexpected payload", true);
+  }
+  languageCache = { at: Date.now(), languages: data };
+  return data;
+}
+
+/** Throws a non-retryable error when the pair is not installed on the server. */
+export async function assertLanguagePair(source: string, target: string): Promise<void> {
+  const languages = await getEngineLanguages();
+  const tgt = toEngineCode(target);
+  const src = source === "auto" ? null : toEngineCode(source);
+  const known = new Set(languages.map((l) => l.code));
+  if (!known.has(tgt)) {
+    throw new TranslationEngineError(
+      `Target language '${target}' is not installed on the LibreTranslate server. Installed: ${[...known].join(", ")}`,
+      false
+    );
+  }
+  if (src) {
+    const entry = languages.find((l) => l.code === src);
+    if (!entry) {
+      throw new TranslationEngineError(`Source language '${source}' is not installed on the LibreTranslate server.`, false);
+    }
+    if (Array.isArray(entry.targets) && !entry.targets.includes(tgt)) {
+      throw new TranslationEngineError(`LibreTranslate cannot translate ${source} -> ${target}.`, false);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+export async function checkEngineHealth(): Promise<{
+  online: boolean;
+  configured: boolean;
+  status: string;
+  engine: string;
+  url: string | null;
+  installed_languages: string[];
+  latency_ms: number | null;
+  error?: string;
+}> {
+  if (!LT_URL) {
+    return {
+      online: false,
+      configured: false,
+      status: "not_configured",
+      engine: "LibreTranslate",
+      url: null,
+      installed_languages: [],
+      latency_ms: null,
+      error: "LIBRETRANSLATE_URL is not set",
+    };
+  }
+  const started = Date.now();
+  try {
+    languageCache = null;
+    const languages = await getEngineLanguages();
+    return {
+      online: true,
+      configured: true,
+      status: "healthy",
+      engine: "LibreTranslate",
+      url: LT_URL,
+      installed_languages: languages.map((l) => l.code),
+      latency_ms: Date.now() - started,
+    };
+  } catch (err) {
+    return {
+      online: false,
+      configured: true,
+      status: "unreachable",
+      engine: "LibreTranslate",
+      url: LT_URL,
+      installed_languages: [],
+      latency_ms: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Low-level LibreTranslate call with retries
+// ---------------------------------------------------------------------------
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callLibreTranslate(
+  q: string[],
+  source: string,
+  target: string,
+  format: "text" | "html",
+  deadline: number
+): Promise<string[]> {
+  const base = requireEngineUrl();
+  const body: Record<string, unknown> = {
+    q,
+    source: source === "auto" ? "auto" : toEngineCode(source),
+    target: toEngineCode(target),
+    format,
+  };
+  if (LT_API_KEY) body.api_key = LT_API_KEY;
+
+  let lastError: TranslationEngineError | null = null;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining < 500) break;
+    try {
+      const res = await fetch(`${base}/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, remaining)),
+        cache: "no-store",
+      });
+      if (res.status === 429 || res.status >= 500) {
+        lastError = new TranslationEngineError(`LibreTranslate returned HTTP ${res.status}`, true);
+      } else if (!res.ok) {
+        let detail = "";
+        try {
+          detail = ((await res.json()) as { error?: string }).error || "";
+        } catch {
+          // body was not JSON
+        }
+        throw new TranslationEngineError(`LibreTranslate returned HTTP ${res.status}${detail ? `: ${detail}` : ""}`, false);
+      } else {
+        const data = (await res.json()) as { translatedText?: unknown };
+        const out = data.translatedText;
+        if (!Array.isArray(out) || out.length !== q.length) {
+          throw new TranslationEngineError("LibreTranslate returned a malformed batch response", true);
+        }
+        return out.map((v) => (typeof v === "string" ? v : ""));
+      }
+    } catch (err) {
+      if (err instanceof TranslationEngineError && !err.retryable) throw err;
+      const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+      lastError =
+        err instanceof TranslationEngineError
+          ? err
+          : new TranslationEngineError(
+              isTimeout ? "LibreTranslate request timed out" : `LibreTranslate unreachable: ${err instanceof Error ? err.message : String(err)}`,
+              true
+            );
+      // A timeout means the server is busy: retrying the same batch would just
+      // time out again, so let the caller split or defer it.
+      if (isTimeout) throw lastError;
+    }
+    const backoff = 400 * 2 ** attempt;
+    if (Date.now() + backoff >= deadline - 500) break;
+    await sleep(backoff);
+  }
+  throw lastError || new TranslationEngineError("LibreTranslate request failed", true);
+}
+
+// ---------------------------------------------------------------------------
+// Segment translation (used by the website pipeline)
+// ---------------------------------------------------------------------------
+
+export type SegmentResult =
+  | { ok: true; text: string }
+  | { ok: false; deferred: true; error: string } // ran out of time / temporary: retry later
+  | { ok: false; deferred: false; error: string }; // permanent failure for this text
+
+function splitIntoBatches(items: { index: number; q: string }[]) {
+  const batches: { index: number; q: string }[][] = [];
+  let current: { index: number; q: string }[] = [];
+  let chars = 0;
+  for (const item of items) {
+    if (current.length && (current.length >= MAX_BATCH_ITEMS || chars + item.q.length > MAX_BATCH_CHARS)) {
+      batches.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(item);
+    chars += item.q.length;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+/**
+ * Translates skeleton segments (see segments.ts). Plain segments go through
+ * format "text"; segments with <gN> placeholders through format "html" and are
+ * validated so no placeholder (link, bold text...) is lost.
+ *
+ * Stops starting new batches when the deadline is near and reports the
+ * untouched segments as `deferred`, so a serverless step never overruns.
+ */
+export async function translateSegments(
+  skeletons: string[],
+  source: string,
+  target: string,
+  deadline: number
+): Promise<SegmentResult[]> {
+  const results: SegmentResult[] = skeletons.map(() => ({ ok: false, deferred: true, error: "not attempted" }));
+
+  const plain: { index: number; q: string }[] = [];
+  const tagged: { index: number; q: string }[] = [];
+  skeletons.forEach((s, index) => {
+    if (skeletonHasPlaceholders(s)) tagged.push({ index, q: s });
+    else plain.push({ index, q: unescapeSkeletonText(s) });
+  });
+
+  const queue: { batch: { index: number; q: string }[]; format: "text" | "html" }[] = [
+    ...splitIntoBatches(plain).map((batch) => ({ batch, format: "text" as const })),
+    ...splitIntoBatches(tagged).map((batch) => ({ batch, format: "html" as const })),
+  ];
+
+  while (queue.length) {
+    // Rough throughput of a CPU-bound LibreTranslate: ~0.5 s per segment.
+    const job = queue[0];
+    if (Date.now() + 1500 > deadline) break;
+    queue.shift();
+    try {
+      const out = await callLibreTranslate(job.batch.map((b) => b.q), source, target, job.format, deadline);
+      job.batch.forEach((item, i) => {
+        const raw = (out[i] || "").trim();
+        if (!raw) {
+          results[item.index] = { ok: false, deferred: false, error: "LibreTranslate returned an empty translation" };
+          return;
+        }
+        if (job.format === "html") {
+          if (!placeholdersMatch(item.q, raw)) {
+            results[item.index] = { ok: false, deferred: false, error: "Translation lost inline markup (links/formatting)" };
+            return;
+          }
+          results[item.index] = { ok: true, text: raw };
+        } else {
+          results[item.index] = { ok: true, text: escapeSkeletonText(raw) };
+        }
+      });
+    } catch (err) {
+      const e = err instanceof TranslationEngineError ? err : new TranslationEngineError(String(err), true);
+      if (!e.retryable) {
+        job.batch.forEach((item) => {
+          results[item.index] = { ok: false, deferred: false, error: e.message };
+        });
+        continue;
+      }
+      // Timed out or server busy: split the batch and try the halves if there is time.
+      if (job.batch.length > 1 && Date.now() + 1500 < deadline) {
+        const mid = Math.ceil(job.batch.length / 2);
+        queue.unshift({ batch: job.batch.slice(mid), format: job.format });
+        queue.unshift({ batch: job.batch.slice(0, mid), format: job.format });
+        continue;
+      }
+      job.batch.forEach((item) => {
+        results[item.index] = { ok: false, deferred: true, error: e.message };
+      });
+      break;
+    }
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Translation memory (only successful translations are ever stored)
+// ---------------------------------------------------------------------------
+
+/** Fake "[ES] text" / "[AR: text]" rows written by pre-rewrite versions; never reuse them. */
+const LEGACY_FALLBACK_RE = /^\[[A-Z]{2,3}(-[A-Z]+)?(\]|:)/;
+
+export async function lookupMemory(
+  userId: number | undefined,
+  sourceTexts: string[],
+  source: string,
+  target: string
+): Promise<Map<string, string>> {
+  const found = new Map<string, string>();
+  if (!sourceTexts.length) return found;
+  const byHash = new Map(sourceTexts.map((t) => [hashSourceText(t), t]));
+  const hashes = [...byHash.keys()];
+  for (let i = 0; i < hashes.length; i += 500) {
+    const slice = hashes.slice(i, i + 500);
+    const shared = await db
+      .select({ hash: sharedTranslationMemory.sourceHash, text: sharedTranslationMemory.translatedText })
+      .from(sharedTranslationMemory)
+      .where(
+        and(
+          inArray(sharedTranslationMemory.sourceHash, slice),
+          eq(sharedTranslationMemory.sourceLang, source),
+          eq(sharedTranslationMemory.targetLang, target)
+        )
+      );
+    for (const row of shared) if (!LEGACY_FALLBACK_RE.test(row.text)) found.set(byHash.get(row.hash)!, row.text);
+    if (userId) {
+      const own = await db
+        .select({ hash: userTranslationMemory.sourceHash, text: userTranslationMemory.translatedText })
+        .from(userTranslationMemory)
+        .where(
+          and(
+            eq(userTranslationMemory.userId, userId),
+            inArray(userTranslationMemory.sourceHash, slice),
+            eq(userTranslationMemory.sourceLang, source),
+            eq(userTranslationMemory.targetLang, target)
+          )
+        );
+      // Personal memory wins over shared memory.
+      for (const row of own) if (!LEGACY_FALLBACK_RE.test(row.text)) found.set(byHash.get(row.hash)!, row.text);
+    }
+  }
+  return found;
+}
+
+export async function saveMemory(
+  userId: number | undefined,
+  entries: { sourceText: string; translatedText: string }[],
+  source: string,
+  target: string
+): Promise<void> {
+  if (!entries.length) return;
+  const rows = entries.map((e) => ({
+    sourceHash: hashSourceText(e.sourceText),
+    sourceLang: source,
+    targetLang: target,
+    sourceText: e.sourceText,
+    translatedText: e.translatedText,
+  }));
+  await db
+    .insert(sharedTranslationMemory)
+    .values(rows)
+    .onConflictDoNothing();
+  if (userId) {
+    await db
+      .insert(userTranslationMemory)
+      .values(rows.map((r) => ({ ...r, userId })))
+      .onConflictDoNothing();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Free-text translation (playground / test endpoint / seed)
+// ---------------------------------------------------------------------------
 
 export interface TranslationResultItem {
   original: string;
   translated: string;
   cached: boolean;
+  ok: boolean;
+  error?: string;
 }
 
 export interface TranslationResponsePayload {
@@ -24,496 +456,44 @@ export interface TranslationResponsePayload {
   target_lang: string;
   target_rtl: boolean;
   count: number;
+  failed_count: number;
   translations: TranslationResultItem[];
   duration_ms: number;
   provider: string;
   model_version: string;
+  detected_language?: string;
 }
 
-import { db } from "@/db";
-import { userTranslationMemory, sharedTranslationMemory } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
-import { hashSourceText } from "./auth";
+const MAX_CHUNK_LENGTH = 400;
 
-const RTL_LANGUAGES = new Set(["ar", "ur", "he", "fa", "ps", "sd", "ug", "yi"]);
-
-// Optional self-hosted LibreTranslate backend (free, open-source, neural MT).
-// Configure via LIBRETRANSLATE_URL (default: http://127.0.0.1:5000) and
-// LIBRETRANSLATE_API_KEY (optional, for hosted instances).
-const LIBRETRANSLATE_URL = (process.env.LIBRETRANSLATE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
-const LIBRETRANSLATE_API_KEY = process.env.LIBRETRANSLATE_API_KEY || "";
-
-// Circuit breaker for LibreTranslate
-let libreTranslateAvailable = true;
-let lastHealthCheck = 0;
-
-// Reset circuit breaker if LibreTranslate has been down for > 60s (allow retry)
-async function checkLibreTranslateHealth(): Promise<boolean> {
-  const now = Date.now();
-  if (now - lastHealthCheck < 60000 && !libreTranslateAvailable) {
-    return false; // Still in cooldown
-  }
-  lastHealthCheck = now;
-  try {
-    const res = await fetch(`${LIBRETRANSLATE_URL}/languages`, {
-      signal: AbortSignal.timeout(3000),
-      cache: "no-store",
-    });
-    if (res.ok) {
-      libreTranslateAvailable = true;
-      return true;
+/** Splits long text at paragraph and sentence boundaries, keeping separators. */
+function splitLongText(text: string): string[] {
+  if (text.length <= MAX_CHUNK_LENGTH) return [text];
+  const parts = text.split(/(\n+)/);
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!part) continue;
+    if (/^\n+$/.test(part) || part.length <= MAX_CHUNK_LENGTH) {
+      out.push(part);
+      continue;
     }
-    libreTranslateAvailable = false;
-    return false;
-  } catch {
-    libreTranslateAvailable = false;
-    return false;
-  }
-}
-
-// Translation memory helpers (per-user + shared testing data)
-async function getMemoryTranslation(
-  userId: number | undefined,
-  sourceText: string,
-  src: string,
-  tgt: string
-): Promise<string | null> {
-  const hash = hashSourceText(sourceText);
-  // 1. Per-user memory
-  if (userId) {
-    try {
-      const rows = await db
-        .select()
-        .from(userTranslationMemory)
-        .where(
-          and(
-            eq(userTranslationMemory.userId, userId),
-            eq(userTranslationMemory.sourceHash, hash),
-            eq(userTranslationMemory.sourceLang, src),
-            eq(userTranslationMemory.targetLang, tgt)
-          )
-        )
-        .limit(1);
-      if (rows.length > 0) return rows[0].translatedText;
-    } catch {
-      // ignore
-    }
-  }
-  // 2. Shared testing memory
-  try {
-    const rows = await db
-      .select()
-      .from(sharedTranslationMemory)
-      .where(
-        and(
-          eq(sharedTranslationMemory.sourceHash, hash),
-          eq(sharedTranslationMemory.sourceLang, src),
-          eq(sharedTranslationMemory.targetLang, tgt)
-        )
-      )
-      .limit(1);
-    if (rows.length > 0) return rows[0].translatedText;
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-async function saveMemoryTranslation(
-  userId: number | undefined,
-  sourceText: string,
-  src: string,
-  tgt: string,
-  translatedText: string,
-  saveToShared: boolean
-): Promise<void> {
-  const hash = hashSourceText(sourceText);
-  if (userId) {
-    try {
-      await db
-        .insert(userTranslationMemory)
-        .values({
-          userId,
-          sourceHash: hash,
-          sourceLang: src,
-          targetLang: tgt,
-          sourceText,
-          translatedText,
-        })
-        .onConflictDoUpdate({
-          target: [userTranslationMemory.userId, userTranslationMemory.sourceHash, userTranslationMemory.sourceLang, userTranslationMemory.targetLang],
-          set: { translatedText, createdAt: new Date() },
-        });
-    } catch {
-      // ignore
-    }
-  }
-  if (saveToShared) {
-    try {
-      await db
-        .insert(sharedTranslationMemory)
-        .values({
-          sourceHash: hash,
-          sourceLang: src,
-          targetLang: tgt,
-          sourceText,
-          translatedText,
-        })
-        .onConflictDoUpdate({
-          target: [sharedTranslationMemory.sourceHash, sharedTranslationMemory.sourceLang, sharedTranslationMemory.targetLang],
-          set: { translatedText, createdAt: new Date() },
-        });
-    } catch {
-      // ignore
-    }
-  }
-}
-
-// In-memory runtime cache for translated strings
-const IN_MEMORY_CACHE = new Map<string, string>();
-
-// Maximum size per atomic network request segment (sentences within 350 chars)
-const MAX_CHUNK_LENGTH = 350;
-
-// Local curated high-quality dictionary for core website content
-const CURATED_DICTIONARY: Record<string, Record<string, string>> = {
-  "es": {
-    "welcome to our website. we provide fast and reliable web translation.": "Bienvenido a nuestro sitio web. Ofrecemos una traducción web rápida y fiable.",
-    "welcome to our website.": "Bienvenido a nuestro sitio web.",
-    "welcome to our website": "Bienvenido a nuestro sitio web",
-    "contact our support team for help.": "Póngase en contacto con nuestro equipo de soporte para obtener ayuda.",
-    "contact our support team for help": "Póngase en contacto con nuestro equipo de soporte para obtener ayuda",
-    "read our privacy policy and terms of service.": "Lea nuestra política de privacidad y condiciones de servicio.",
-    "read our privacy policy and terms of service": "Lea nuestra política de privacidad y condiciones de servicio",
-    "translate your website in minutes without paid apis.": "Traduzca su sitio web en minutos sin API de pago.",
-    "home": "Inicio",
-    "about us": "Sobre nosotros",
-    "services": "Servicios",
-    "contact": "Contacto",
-    "contact us": "Contáctenos",
-    "pricing": "Precios",
-    "translate": "Traducir",
-    "translate website": "Traducir sitio web",
-    "save changes": "Guardar cambios",
-    "approve translation": "Aprobar traducción",
-    "our mission is to break language barriers across the global web.": "Nuestra misión es romper las barreras lingüísticas en la web global.",
-    "cloud infrastructure and localization solutions": "Soluciones de localización e infraestructura en la nube",
-    "get in touch with our engineers today.": "Póngase en contacto con nuestros ingenieros hoy.",
-    "hello world": "Hola mundo",
-  },
-  "ar": {
-    "welcome to our website. we provide fast and reliable web translation.": "مرحبا بكم في موقعنا. نحن نقدم ترجمة موقع سريعة وموثوق بها.",
-    "welcome to our website.": "مرحبا بكم في موقعنا",
-    "welcome to our website": "مرحبا بكم في موقعنا",
-    "contact our support team for help.": "اتصل بفريق الدعم للمساعدة",
-    "contact our support team for help": "اتصل بفريق الدعم للمساعدة",
-    "read our privacy policy and terms of service.": "اقرأي سياستنا الخاصة وشروط الخدمة",
-    "read our privacy policy and terms of service": "اقرأي سياستنا الخاصة وشروط الخدمة",
-    "translate your website in minutes without paid apis.": "ترجم موقعك في دقائق بدون واجهات برمجة تطبيقات مدفوعة.",
-    "home": "الرئيسية",
-    "about us": "من نحن",
-    "services": "خدماتنا",
-    "contact": "اتصل بنا",
-    "contact us": "اتصل بنا",
-    "pricing": "الأسعار",
-    "translate": "ترجمة",
-    "translate website": "ترجمة الموقع",
-    "save changes": "حفظ التغييرات",
-    "approve translation": "اعتماد الترجمة",
-    "our mission is to break language barriers across the global web.": "مهمتنا هي كسر الحواجز اللغوية عبر الويب العالمي.",
-    "cloud infrastructure and localization solutions": "البنية التحتية السحابية وحلول الترجمة المحلية",
-    "get in touch with our engineers today.": "تواصل مع مهندسينا اليوم.",
-    "hello world": "مرحبا بالعالم",
-  },
-  "ur": {
-    "welcome to our website. we provide fast and reliable web translation.": "ہماری ویب سائٹ پر خوش آمدید۔ ہم تیز رفتار اور قابل اعتماد ویب ترجمہ فراہم کرتے ہیں۔",
-    "welcome to our website.": "ہماری ویب سائٹ پر خوش آمدید",
-    "welcome to our website": "ہماری ویب سائٹ پر خوش آمدید",
-    "contact our support team for help.": "مدد کے لئے ہماری ٹیم سے رابطہ کریں.",
-    "contact our support team for help": "مدد کے لئے ہماری ٹیم سے رابطہ کریں.",
-    "read our privacy policy and terms of service.": "اپنی نجی پالیسی اور خدمت کی شرائط پڑھیں ۔",
-    "read our privacy policy and terms of service": "اپنی نجی پالیسی اور خدمت کی شرائط پڑھیں ۔",
-    "translate your website in minutes without paid apis.": "اپنی ویب سائٹ کا منٹوں میں ترجمہ کریں بغیر کسی معاوضہ کے۔",
-    "home": "صفحہ اول",
-    "about us": "ہمارے بارے میں",
-    "services": "خدمات",
-    "contact": "رابطہ کریں",
-    "contact us": "ہم سے رابطہ کریں",
-    "pricing": "قیمتیں",
-    "translate": "ترجمہ کریں",
-    "translate website": "ویب سائٹ کا ترجمہ کریں",
-    "save changes": "تبدیلیاں محفوظ کریں",
-    "approve translation": "ترجمہ کی توثیق کریں",
-    "our mission is to break language barriers across the global web.": "ہمارا مقصد عالمی ویب پر زبان کی رکاوٹوں کو توڑنا ہے۔",
-    "cloud infrastructure and localization solutions": "کلاؤڈ انفراسٹرکچر اور لوکلائزیشن حل",
-    "get in touch with our engineers today.": "آج ہی ہمارے انجینئرز سے رابطہ کریں۔",
-    "hello world": "ہیلو دنیا",
-  },
-  "fr": {
-    "welcome to our website. we provide fast and reliable web translation.": "Bienvenue sur notre site Web. Nous offrons une traduction web rapide et fiable.",
-    "welcome to our website.": "Bienvenue sur notre site Web.",
-    "contact our support team for help.": "Contactez notre équipe d'assistance pour obtenir de l'aide.",
-    "read our privacy policy and terms of service.": "Lisez notre politique de confidentialité et nos conditions d'utilisation.",
-    "home": "Accueil",
-    "about us": "À propos de nous",
-    "services": "Services",
-    "contact": "Contact",
-    "hello world": "Bonjour le monde",
-  },
-  "de": {
-    "welcome to our website. we provide fast and reliable web translation.": "Willkommen auf unserer Website. Wir bieten schnelle und zuverlässige Webübersetzungen.",
-    "welcome to our website.": "Willkommen auf unserer Website.",
-    "contact our support team for help.": "Kontaktieren Sie unser Support-Team für Hilfe.",
-    "read our privacy policy and terms of service.": "Lesen Sie unsere Datenschutzrichtlinie und Nutzungsbedingungen.",
-    "home": "Startseite",
-    "about us": "Über uns",
-    "services": "Dienstleistungen",
-    "contact": "Kontakt",
-    "hello world": "Hallo Welt",
-  }
-};
-
-/**
- * Checks the translation engine health status
- */
-export async function checkEngineHealth(): Promise<{
-  online: boolean;
-  status: string;
-  engine: string;
-  uptime_seconds: number;
-  installed_pairs: string[];
-  max_text_length: number;
-  zero_paid_api: boolean;
-}> {
-  return {
-    online: true,
-    status: "healthy",
-    engine: "WebLingo Self-Hosted & Open-Source Engine",
-    uptime_seconds: Math.round(process.uptime()),
-    installed_pairs: ["en->es", "en->ar", "en->ur", "en->fr", "en->de", "en->it"],
-    max_text_length: 50000, // Unlimited chunking supported
-    zero_paid_api: true,
-  };
-}
-
-/**
- * Splits arbitrary text into manageable sentence-based chunks to handle
- * arbitrarily long articles, paragraphs, and webpages.
- */
-function splitIntoNaturalChunks(text: string, maxLen = MAX_CHUNK_LENGTH): string[] {
-  // If already under max length, return as single chunk
-  if (text.length <= maxLen) {
-    return [text];
-  }
-
-  // Split by double newline (paragraphs) first
-  if (text.includes("\n")) {
-    const paragraphs = text.split(/(\n+)/);
-    const result: string[] = [];
-    for (const p of paragraphs) {
-      if (!p.trim()) {
-        result.push(p);
-      } else {
-        result.push(...splitIntoNaturalChunks(p, maxLen));
+    const sentences = part.match(/[^.!?؟۔;]+[.!?؟۔;]*\s*/g) || [part];
+    let current = "";
+    for (const s of sentences) {
+      if (current && (current + s).length > MAX_CHUNK_LENGTH) {
+        out.push(current);
+        current = "";
       }
+      current += s;
     }
-    return result;
+    if (current) out.push(current);
   }
-
-  // Split by sentence delimiters (. ! ? ;)
-  const sentenceRegex = /([^.!?؛;]+[.!?؛;]+(?:\s+|$)|[^.!?؛;]+$)/g;
-  const rawSentences = text.match(sentenceRegex) || [text];
-
-  const chunks: string[] = [];
-  let currentChunk = "";
-
-  for (const s of rawSentences) {
-    if ((currentChunk + s).length <= maxLen) {
-      currentChunk += s;
-    } else {
-      if (currentChunk) {
-        chunks.push(currentChunk);
-      }
-      if (s.length > maxLen) {
-        // Fallback: split long sentences by comma or space
-        const words = s.split(/(\s+)/);
-        let wordChunk = "";
-        for (const w of words) {
-          if ((wordChunk + w).length <= maxLen) {
-            wordChunk += w;
-          } else {
-            if (wordChunk) chunks.push(wordChunk);
-            wordChunk = w;
-          }
-        }
-        if (wordChunk) chunks.push(wordChunk);
-        currentChunk = "";
-      } else {
-        currentChunk = s;
-      }
-    }
-  }
-
-  if (currentChunk) {
-    chunks.push(currentChunk);
-  }
-
-  return chunks.filter(c => c.length > 0);
+  return out;
 }
 
 /**
- * Attempts translation via a self-hosted LibreTranslate instance.
- * Returns null when unavailable or on failure, so callers can fall back.
- */
-async function translateViaLibreTranslate(trimmed: string, src: string, tgt: string): Promise<string | null> {
-  if (!libreTranslateAvailable) {
-    // Check if LibreTranslate has recovered
-    const available = await checkLibreTranslateHealth();
-    if (!available) return null;
-  }
-  try {
-    const body: Record<string, unknown> = {
-      q: trimmed,
-      source: src,
-      target: tgt,
-      format: "text",
-    };
-    if (LIBRETRANSLATE_API_KEY) body.api_key = LIBRETRANSLATE_API_KEY;
-
-    const res = await fetch(`${LIBRETRANSLATE_URL}/translate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(3000),
-      cache: "no-store",
-    });
-
-    if (!res.ok) return null;
-    const data = await res.json();
-    const raw = data?.translatedText;
-    if (typeof raw === "string" && raw.trim() && raw.trim() !== trimmed) {
-      return raw.trim();
-    }
-    return null;
-  } catch {
-    libreTranslateAvailable = false;
-    return null;
-  }
-}
-
-/**
- * Translates an individual atomic segment (<350 chars)
- */
-async function translateAtomicSegment(text: string, src: string, tgt: string, userId?: number, saveToShared?: boolean): Promise<string> {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return text;
-  }
-
-  if (src === tgt) {
-    return text;
-  }
-
-  const cacheKey = `${userId ?? "anon"}:${src}->${tgt}:${trimmed}`;
-  if (IN_MEMORY_CACHE.has(cacheKey)) {
-    return IN_MEMORY_CACHE.get(cacheKey)!;
-  }
-
-  // 0. Check translation memory (per-user then shared)
-  const memResult = await getMemoryTranslation(userId, trimmed, src, tgt);
-  if (memResult) {
-    IN_MEMORY_CACHE.set(cacheKey, memResult);
-    return memResult;
-  }
-
-  // 1. Check curated dictionary
-  const normalizedLower = trimmed.toLowerCase();
-  const langDict = CURATED_DICTIONARY[tgt];
-  if (langDict && langDict[normalizedLower]) {
-    const res = langDict[normalizedLower];
-    IN_MEMORY_CACHE.set(cacheKey, res);
-    await saveMemoryTranslation(userId, trimmed, src, tgt, res, saveToShared ?? false);
-    return res;
-  }
-
-  // 2. Try self-hosted LibreTranslate (neural MT, free, offline-capable)
-  const libreResult = await translateViaLibreTranslate(trimmed, src, tgt);
-  if (libreResult) {
-    IN_MEMORY_CACHE.set(cacheKey, libreResult);
-    await saveMemoryTranslation(userId, trimmed, src, tgt, libreResult, saveToShared ?? false);
-    return libreResult;
-  }
-
-  // MyMemory removed - using LibreTranslate + curated dict + fallback only
-  // Final fallback if LibreTranslate was unreachable
-  const isRtl = RTL_LANGUAGES.has(tgt);
-  const fallback = isRtl
-    ? `[${tgt.toUpperCase()}: ${trimmed}]`
-    : `[${tgt.toUpperCase()}] ${trimmed}`;
-  IN_MEMORY_CACHE.set(cacheKey, fallback);
-  await saveMemoryTranslation(userId, trimmed, src, tgt, fallback, saveToShared ?? false);
-  return fallback;
-}
-
-/**
- * Translates arbitrary length text by chunking, translating each part,
- * and seamlessly reassembling the content.
- */
-async function translateString(text: string, sourceLang: string, targetLang: string, userId?: number, saveToShared?: boolean): Promise<{ translated: string; cached: boolean }> {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return { translated: "", cached: false };
-  }
-
-  const src = sourceLang.toLowerCase().trim();
-  const tgt = targetLang.toLowerCase().trim();
-
-  if (src === tgt) {
-    return { translated: text, cached: true };
-  }
-
-  const cacheKey = `${userId ?? "anon"}:${src}->${tgt}:${trimmed}`;
-  if (IN_MEMORY_CACHE.has(cacheKey)) {
-    return { translated: IN_MEMORY_CACHE.get(cacheKey)!, cached: true };
-  }
-
-  // Check translation memory (per-user then shared)
-  const memResult = await getMemoryTranslation(userId, trimmed, src, tgt);
-  if (memResult) {
-    IN_MEMORY_CACHE.set(cacheKey, memResult);
-    return { translated: memResult, cached: true };
-  }
-
-  // Break into natural chunks if text exceeds atomic segment limit
-  const chunks = splitIntoNaturalChunks(trimmed, MAX_CHUNK_LENGTH);
-
-  if (chunks.length === 1) {
-    const trans = await translateAtomicSegment(chunks[0], src, tgt, userId, saveToShared);
-    IN_MEMORY_CACHE.set(cacheKey, trans);
-    return { translated: trans, cached: false };
-  }
-
-  // Translate all chunks in parallel with controlled concurrency
-  const translatedChunks: string[] = [];
-  for (let i = 0; i < chunks.length; i += 3) {
-    const batch = chunks.slice(i, i + 3);
-    const batchResults = await Promise.all(
-      batch.map(chunk => {
-        if (/^\s+$/.test(chunk)) return Promise.resolve(chunk);
-        return translateAtomicSegment(chunk, src, tgt, userId, saveToShared);
-      })
-    );
-    translatedChunks.push(...batchResults);
-  }
-
-  // Reassemble seamlessly
-  const fullTranslated = translatedChunks.join(" ");
-  IN_MEMORY_CACHE.set(cacheKey, fullTranslated);
-  return { translated: fullTranslated, cached: false };
-}
-
-/**
- * Translates a batch of texts without character length restrictions
+ * Translates arbitrary plain texts. Failed items keep their original text and
+ * are flagged with ok=false (never silently replaced).
  */
 export async function translateBatch(params: {
   source_lang: string;
@@ -521,42 +501,88 @@ export async function translateBatch(params: {
   texts: string[];
   userId?: number;
   saveToShared?: boolean;
+  timeoutMs?: number;
 }): Promise<TranslationResponsePayload> {
-  const { source_lang = "en", target_lang = "es", texts = [], userId, saveToShared } = params;
-  const tStart = performance.now();
-  const isRtl = RTL_LANGUAGES.has(target_lang.toLowerCase());
+  const { source_lang = "en", target_lang = "es", texts = [], userId } = params;
+  const started = Date.now();
+  const deadline = started + (params.timeoutMs ?? 25000);
+  const src = source_lang.toLowerCase().trim();
+  const tgt = target_lang.toLowerCase().trim();
 
-  const results: TranslationResultItem[] = new Array(texts.length);
+  const results: TranslationResultItem[] = texts.map((t) => ({ original: t, translated: t, cached: false, ok: false, error: "not attempted" }));
 
-  // Process translations in parallel with controlled concurrency (20 at a time for speed)
-  const CONCURRENCY = 20;
-  for (let i = 0; i < texts.length; i += CONCURRENCY) {
-    const batch = texts.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(
-      batch.map((text, idx) =>
-        translateString(text, source_lang, target_lang, userId, saveToShared).then(res => ({
-          index: i + idx,
-          original: text,
-          translated: res.translated,
-          cached: res.cached,
-        }))
-      )
-    );
-    for (const r of batchResults) {
-      results[r.index] = { original: r.original, translated: r.translated, cached: r.cached };
+  if (src === tgt) {
+    results.forEach((r) => Object.assign(r, { ok: true, cached: true, error: undefined }));
+  } else {
+    await assertLanguagePair(src, tgt);
+    const memSources = texts.map((t) => t.trim()).filter(Boolean);
+    const memory = src === "auto" ? new Map<string, string>() : await lookupMemory(userId, memSources, src, tgt);
+
+    // Collect unique chunks that still need the engine.
+    const chunkPlan = texts.map((t) => {
+      const trimmed = t.trim();
+      if (!trimmed) return { chunks: [] as string[], memory: "" };
+      const mem = memory.get(trimmed);
+      if (mem) return { chunks: [] as string[], memory: mem };
+      return { chunks: splitLongText(trimmed), memory: "" };
+    });
+    const unique = [...new Set(chunkPlan.flatMap((p) => p.chunks.filter((c) => c.trim() && !/^\n+$/.test(c))))];
+    const batches = splitIntoBatches(unique.map((q, index) => ({ index, q })));
+    const translatedChunks = new Map<string, string>();
+    let firstError: string | undefined;
+    for (const batch of batches) {
+      try {
+        const out = await callLibreTranslate(batch.map((b) => b.q.trim()), src, tgt, "text", deadline);
+        batch.forEach((b, i) => {
+          const value = (out[i] || "").trim();
+          if (value) translatedChunks.set(b.q, value);
+        });
+      } catch (err) {
+        firstError = err instanceof Error ? err.message : String(err);
+        if (err instanceof TranslationEngineError && !err.retryable) break;
+      }
+    }
+
+    const toRemember: { sourceText: string; translatedText: string }[] = [];
+    chunkPlan.forEach((plan, i) => {
+      const r = results[i];
+      if (!texts[i].trim()) {
+        Object.assign(r, { translated: texts[i], ok: true, error: undefined });
+      } else if (plan.memory) {
+        Object.assign(r, { translated: plan.memory, cached: true, ok: true, error: undefined });
+      } else {
+        const missing = plan.chunks.filter((c) => c.trim() && !/^\n+$/.test(c) && !translatedChunks.has(c));
+        if (missing.length) {
+          Object.assign(r, { translated: texts[i], ok: false, error: firstError || "Translation failed" });
+        } else {
+          const joined = plan.chunks
+            .map((c) => (/^\n+$/.test(c) ? c : translatedChunks.get(c) ?? c))
+            .join(" ")
+            .replace(/ ?(\n+) ?/g, "$1")
+            .trim();
+          Object.assign(r, { translated: joined, ok: true, error: undefined });
+          if (src !== "auto") toRemember.push({ sourceText: texts[i].trim(), translatedText: joined });
+        }
+      }
+    });
+    if (params.saveToShared !== false) {
+      try {
+        await saveMemory(userId, toRemember, src, tgt);
+      } catch (err) {
+        console.error("[engine] failed to save translation memory:", err);
+      }
     }
   }
 
-  const durationMs = Math.round(performance.now() - tStart);
-
   return {
-    source_lang,
-    target_lang,
-    target_rtl: isRtl,
+    source_lang: src,
+    target_lang: tgt,
+    target_rtl: isRtlLanguage(tgt),
     count: results.length,
+    failed_count: results.filter((r) => !r.ok).length,
     translations: results,
-    duration_ms: durationMs,
-    provider: "weblingo_open_source_engine",
-    model_version: "v1.2-unlimited-chunking",
+    duration_ms: Date.now() - started,
+    provider: "libretranslate",
+    model_version: "libretranslate",
   };
 }

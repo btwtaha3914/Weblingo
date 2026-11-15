@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Northwind Studio — Web design for small teams</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 0; color: #222; }
+    header, footer { background: #f4efe6; padding: 16px 24px; }
+    nav a { margin-right: 16px; color: #7a3e00; }
+    main { max-width: 760px; margin: 0 auto; padding: 24px; }
+    .card { border: 1px solid #ddd; padding: 16px; margin: 12px 0; border-radius: 8px; }
+    /* Host-site styles that a badly isolated widget would inherit */
+    button { background: hotpink; font-size: 22px; }
+    * { letter-spacing: 0.5px; }
+  </style>
+  <script src="__API__/widget.js" data-project-key="__KEY__" data-default-language="en" defer></script>
+</head>
+<body>
+  <header>
+    <nav aria-label="Main navigation">
+      <a href="index.html">Home</a>
+      <a href="about.html">About us</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#contact">Contact</a>
+    </nav>
+  </header>
+  <!-- This comment must never be translated -->
+  <main>
+    <h1>Websites that <strong>grow</strong> with your business</h1>
+    <p>We design fast, accessible websites for small teams. Read our <a href="#privacy">privacy policy</a> and <a href="#terms">terms of service</a> before you sign up.</p>
+    <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="Our team working together" width="1" height="1">
+
+    <section id="pricing">
+      <h2>Pricing</h2>
+      <div class="card">
+        <h3>Starter plan</h3>
+        <p>Perfect for a personal portfolio or a small shop.</p>
+        <ul>
+          <li>One custom design</li>
+          <li>Free hosting for one year</li>
+          <li>Email support</li>
+        </ul>
+        <button type="button">Choose this plan</button>
+      </div>
+      <div class="card">
+        <h3>Business plan</h3>
+        <p>Everything in Starter, plus a blog and online booking.</p>
+        <button type="button">Choose this plan</button>
+      </div>
+      <table>
+        <thead><tr><th>Feature</th><th>Starter</th><th>Business</th></tr></thead>
+        <tbody><tr><td>Online booking</td><td>No</td><td>Yes</td></tr></tbody>
+      </table>
+    </section>
+
+    <section id="contact">
+      <h2>Contact</h2>
+      <form onsubmit="return false">
+        <label for="email">Your email address</label>
+        <input id="email" type="email" placeholder="you@example.com">
+        <label for="msg">How can we help?</label>
+        <textarea id="msg" placeholder="Tell us about your project"></textarea>
+        <input type="submit" value="Send message">
+      </form>
+    </section>
+
+    <p translate="no">Northwind Studio™</p>
+    <p class="notranslate">Do not translate this sentence.</p>
+    <p hidden>This hidden sentence is not visible.</p>
+    <pre>const code = "never translated";</pre>
+    <p>Unicode check: café, naïve, 東京, “quotes” &amp; ampersands.</p>
+    <div id="dynamic-zone"></div>
+  </main>
+  <footer>
+    <p>© 2026 Northwind Studio. All rights reserved.</p>
+    <a href="about.html">About us</a>
+  </footer>
+  <script>
+    // Simulates content a JavaScript framework adds after load.
+    setTimeout(function () {
+      var p = document.createElement("p");
+      p.id = "late-text";
+      p.textContent = "Free hosting for one year";
+      document.getElementById("dynamic-zone").appendChild(p);
+    }, 1500);
+  </script>
+</body>
+</html>

@@ -1,6 +1,18 @@
 import crypto from "crypto";
 
-const JWT_SECRET = process.env.JWT_SECRET || "weblingo_secure_session_secret_2026_key_9988";
+let devSecret: string | null = null;
+
+/** Session signing secret. Never falls back to a hardcoded value. */
+function getSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (secret && secret.length >= 16) return secret;
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET must be set (at least 16 characters) in production.");
+  }
+  // Development only: a per-process random secret (sessions reset on restart).
+  devSecret ??= crypto.randomBytes(32).toString("hex");
+  return devSecret;
+}
 
 export interface SessionUser {
   id: number;
@@ -41,7 +53,7 @@ export function createSessionToken(user: SessionUser, expiresInHours = 72): stri
   const payload = JSON.stringify({ ...user, exp: expiresAt });
   const encodedPayload = Buffer.from(payload).toString("base64url");
   const signature = crypto
-    .createHmac("sha256", JWT_SECRET)
+    .createHmac("sha256", getSecret())
     .update(encodedPayload)
     .digest("base64url");
   return `${encodedPayload}.${signature}`;
@@ -56,7 +68,7 @@ export function verifySessionToken(token: string): SessionUser | null {
     if (!encodedPayload || !signature) return null;
 
     const expectedSignature = crypto
-      .createHmac("sha256", JWT_SECRET)
+      .createHmac("sha256", getSecret())
       .update(encodedPayload)
       .digest("base64url");
 

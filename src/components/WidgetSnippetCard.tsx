@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { buildEmbedSnippet, usePublicAppOrigin } from "@/lib/client-utils";
 
 const LANG_OPTIONS = [
   { code: "es", name: "Spanish", native: "Español" },
@@ -34,10 +35,10 @@ const LANG_OPTIONS = [
 ];
 
 export function WidgetSnippetCard({
-  apiKey = "wl_live_demo_key_77889900aabbccdd",
+  apiKey,
   projectName = "Apex Global Technology",
 }: {
-  apiKey?: string;
+  apiKey: string;
   projectName?: string;
 }) {
   const [copied, setCopied] = useState(false);
@@ -50,9 +51,8 @@ export function WidgetSnippetCard({
     );
   };
 
-  const origin = typeof window !== "undefined" ? window.location.origin : "https://YOUR-DOMAIN";
-  const langs = selected.length > 0 ? selected.join(",") : "es";
-  const snippet = `<!-- WebLingo Website Translation Widget -->\n<script src="${origin}/widget.js" data-project-key="${apiKey}" data-api-url="${origin}" data-languages="${langs}" async></script>`;
+  const origin = usePublicAppOrigin();
+  const snippet = buildEmbedSnippet({ apiKey, languages: selected, defaultLanguage: "en", origin });
 
   const handleCopy = () => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
@@ -108,7 +108,7 @@ export function WidgetSnippetCard({
       </div>
 
       <div className="relative">
-        <pre className="p-4 rounded-2xl bg-slate-950 border border-slate-800 text-xs font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+        <pre className="p-4 pr-32 rounded-2xl bg-slate-950 border border-slate-800 text-xs font-mono text-emerald-400 overflow-x-auto whitespace-pre leading-relaxed">
           {snippet}
         </pre>
         <button

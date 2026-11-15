@@ -1,3 +1,6 @@
+# Python dependencies for the LibreTranslate SERVER only (runs on your own
+# machine/VPS, not on Netlify). The WebLingo app itself is Node.js/Next.js and
+# talks to LibreTranslate over its REST API. See LIBRETRANSLATE_DEPLOY.md.
 libretranslate==1.9.6
 argostranslate==1.9.6
 ctranslate2>=4.0
@@ -16,8 +19,6 @@ packaging==23.1
 polib==1.1.1
 prometheus-client==0.15.0
 waitress==2.1.2
-werkzeug==2.3.8
-itsdangerous==2.1.2
 langdetect==1.0.9
 lexilang==1.0.7
 minisbd==0.9.5

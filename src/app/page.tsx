@@ -77,8 +77,8 @@ export default async function HomePage() {
         {/* Core Tool: Quick Webpage Translator */}
         <div id="translator" className="scroll-mt-20">
           <QuickTranslateBar
-            projectId={activeProject ? activeProject.id : 1}
-            apiKey={activeProject?.apiKey || "wl_live_demo_key_77889900aabbccdd"}
+            projectId={activeProject?.id}
+            apiKey={activeProject?.apiKey}
           />
         </div>
 

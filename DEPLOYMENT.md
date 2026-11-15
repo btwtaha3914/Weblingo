@@ -1,140 +1,77 @@
-# Deployment Guide — WebLingo to Public IP (http://117.102.26.14)
+# Deployment
 
-## Prerequisites on the Server
-- Node.js 18+ (LTS recommended)
-- PostgreSQL 15+ (running, accessible)
-- (Optional) LibreTranslate for neural MT quality
+WebLingo has two parts that are deployed separately:
 
-## Option A: Full Project Deploy (Recommended)
+| Part | Runtime | Where |
+| --- | --- | --- |
+| WebLingo app (dashboard, APIs, `widget.js`) | Node.js / Next.js | Netlify (or any Node host) |
+| LibreTranslate | Python | Your own server, e.g. `http://117.102.7.15:8089` |
 
-### 1. Upload the project
-Upload the entire project folder (excluding `node_modules`, `.next`, `.env`) to the server:
-```
-/var/www/weblingo/   (or C:\inetpub\weblingo\ on Windows)
-```
+## 1. LibreTranslate server
 
-### 2. Install dependencies
+Already running at `117.102.7.15:8089`. Recommended hardening, because the
+server currently accepts requests from anyone without a key (`keyRequired: false`):
+
+- Put it behind HTTPS (Caddy or nginx) so text travels encrypted between Netlify
+  and the server.
+- Enable API keys (`libretranslate --api-keys`), create a key, and set
+  `LIBRETRANSLATE_API_KEY` in Netlify. Otherwise anyone can use your server's CPU.
+- Speed is CPU-bound: parallel requests do not increase throughput. More CPU
+  cores (`--threads`), or a GPU build, make translation faster.
+- Load only the languages you need (`--load-only en,es,fr,de,ar,ur,zh`) to save RAM.
+
+See [LIBRETRANSLATE_DEPLOY.md](LIBRETRANSLATE_DEPLOY.md) for installation.
+
+## 2. Database
+
+Any internet-reachable PostgreSQL works; Neon's free tier is enough. Create the
+tables once from your machine:
+
 ```bash
-cd /var/www/weblingo
-npm install
+DATABASE_URL="postgresql://..." npm run db:push
 ```
 
-### 3. Configure environment
+## 3. Netlify
+
+1. Import the Git repository in Netlify. Build settings come from `netlify.toml`.
+2. Environment variables (Site configuration → Environment variables):
+
+   | Variable | Example | Required |
+   | --- | --- | --- |
+   | `DATABASE_URL` | `postgresql://user:pass@ep-x.neon.tech/weblingo?sslmode=require` | yes |
+   | `JWT_SECRET` | 64 random hex chars | yes |
+   | `LIBRETRANSLATE_URL` | `http://117.102.7.15:8089` | yes |
+   | `NEXT_PUBLIC_APP_URL` | `https://weblingo.netlify.app` | recommended |
+   | `LIBRETRANSLATE_API_KEY` | key from your server | if keys enabled |
+   | `REQUIRE_AUTH` | `true` | for multi-user use |
+   | `WIDGET_REQUIRE_DOMAINS` | `true` | to lock the widget to listed domains |
+
+   `NEXT_PUBLIC_APP_URL` is read at build time; redeploy after changing it.
+3. Deploy, then verify:
+   - `https://YOUR-SITE/api/health` → `{"ok":true,"database":true,...}`
+   - `https://YOUR-SITE/widget.js` loads
+   - Translate a page in the dashboard and install the snippet on a test site.
+
+### Function time limits
+
+Netlify ends synchronous function requests after 10 s (26 s on plans where it
+can be raised). WebLingo keeps every request short:
+
+- Extracting a page: one request per page, fetch limited to `EXTRACTION_TIMEOUT_MS` (6 s).
+- Translating: `POST /api/jobs/:id` runs one step of at most `JOB_STEP_BUDGET_MS`
+  (7 s), sized from the measured LibreTranslate speed. The dashboard calls it
+  until the job is done and shows the real counts.
+- A cancelled or interrupted job loses nothing: finished translations are saved,
+  and the next run continues with the rest.
+
+If your plan allows 26 s functions, raise `JOB_STEP_BUDGET_MS` to about `20000`
+for fewer, larger steps.
+
+## Other Node hosts (VPS)
+
 ```bash
-cp .env.example .env
-nano .env   # Edit with your values:
-```
-```
-NODE_ENV=production
-APP_URL=http://117.102.26.14
-DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/weblingo
-JWT_SECRET=your-64-char-random-secret
-COOKIE_SECURE=false
-LIBRETRANSLATE_URL=http://127.0.0.1:5000   # optional
+npm ci && npm run build
+NODE_ENV=production PORT=3000 npm start
 ```
 
-### 4. Set up database
-```bash
-npm run db:push    # Creates all 13 tables
-npm run db:seed    # Seeds demo data
-```
-
-### 5. Build and start
-```bash
-npm run build
-npm run start       # Starts on port 3000
-```
-
-### 6. (Optional) Start LibreTranslate
-```bash
-pip install libretranslate
-libretranslate --host 0.0.0.0 --port 5000
-```
-
-### 7. Configure reverse proxy (if needed)
-If you want WebLingo on port 80 instead of 3000, use nginx/Apache:
-```
-# nginx example:
-server {
-    listen 80;
-    server_name 117.102.26.14;
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-## Option B: Standalone Deploy (No npm install needed)
-
-The `.next/standalone/` directory contains a pre-built server with all dependencies.
-
-### 1. Upload standalone directory
-Upload `.next/standalone/` contents to the server:
-```
-/var/www/weblingo/
-├── server.js
-├── package.json
-├── .env
-├── .next/
-├── public/
-└── node_modules/
-```
-
-### 2. Configure .env on server
-Edit `.env` with production values (see Step 3 above).
-
-### 3. Set up database (need drizzle-kit)
-```bash
-npm install -g drizzle-kit tsx
-cd /var/www/weblingo
-npx drizzle-kit push
-npx tsx src/db/run-seed.ts   # Need src/ folder too
-```
-Note: For standalone, you also need `src/` folder for seed scripts. Or run seed from your dev machine pointing at the production DB.
-
-### 4. Start server
-```bash
-node server.js
-# Or with PM2 for persistence:
-pm2 start server.js --name weblingo
-```
-
-## Accessing the App
-- Dashboard: `http://117.102.26.14:3000/` (or port 80 with reverse proxy)
-- Client demo: `http://117.102.26.14:3000/client-demo`
-- Health check: `http://117.102.26.14:3000/api/health`
-- Widget: `http://117.102.26.14:3000/widget.js`
-
-## Template Site Deployment
-Upload the `public/demo/` folder contents to your shared hosting:
-```
-public_html/taha/weblingo/
-├── index.html
-├── about.html
-├── services.html
-├── products.html
-├── blog.html
-├── contact.html
-├── faq.html
-├── privacy.html
-└── widget.js   (copy from WebLingo server)
-```
-
-Then:
-1. Open `http://117.102.26.14/taha/weblingo/index.html` in browser
-2. In WebLingo dashboard, create a project with base URL `http://117.102.26.14/taha/weblingo/`
-3. Add `117.102.26.14` to allowed domains
-4. Translate the site (single page or whole website)
-5. Copy the generated script tag
-6. Paste into the template's `<head>` section
-7. Re-upload and test
-
-## Important Notes
-- `.env` is gitignored — create it on the server
-- `NODE_ENV=production` disables dev-mode SSRF bypass (localhost blocked in production)
-- `COOKIE_SECURE=false` for HTTP (set to `true` if using HTTPS)
-- LibreTranslate is optional — falls back to MyMemory if unavailable
-- The widget.js can be served from the same origin as the template (no PNA issues)
+Put it behind HTTPS (the widget must be served over HTTPS for HTTPS websites).

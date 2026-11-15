@@ -1,67 +1,75 @@
 /**
- * WebLingo Safe Webpage Extractor & DOM Parser
- * 
- * Features:
- * - SSRF protection: blocks unsafe destinations and private networks unless an exact host is allowlisted.
- * - Redirects are revalidated so a public page cannot redirect the fetcher to an internal service.
- * - Built-in simulation fallback for demo sites (e.g. demo.weblingo.local) to enable full test flows.
- * - Response size limit: enforces 5 MB limit to prevent memory exhaustion attacks.
- * - Timeout handling: strict 10s fetch abort controller.
- * - Preserves structural selectors (h1..h6, p, a, button, li, th, td, label, span).
- * - Excludes script, style, noscript, svg, code, pre, iframe, and elements with `data-no-translate` or `translate="no"`.
- * - Deduplicates text using deterministic SHA-256 hashes.
+ * WebLingo webpage fetcher & extractor.
+ *
+ * - SSRF protection: only http/https, DNS-resolved addresses are checked,
+ *   loopback / link-local / metadata ranges always blocked, private ranges
+ *   blocked unless allow-listed, and every redirect hop is re-validated.
+ * - Size (EXTRACTION_MAX_SIZE_BYTES) and time (EXTRACTION_TIMEOUT_MS) limits.
+ * - Parses HTML with a real, error-tolerant parser (node-html-parser) and
+ *   splits the page into segments using the shared rules in segments.ts, so
+ *   every extracted string can be matched by the browser widget.
+ * - Extracts text runs (headings, paragraphs, nav, buttons, links, lists,
+ *   tables, labels, captions, footer...), <title>, and visible text attributes
+ *   (alt, title, placeholder, aria-label, button-like input values).
+ * - Skips scripts, styles, comments, hidden elements and translate="no".
+ * - Ordinary HTTP fetching cannot see text that is rendered by JavaScript in
+ *   the browser; such pages are flagged with `likelyClientRendered`, and the
+ *   widget reports text it sees but has no translation for (see
+ *   /api/widget/missing) so it gets translated on the next run.
  */
 
+import { parse, HTMLElement, Node as ParsedNode, NodeType } from "node-html-parser";
 import { hashSourceText } from "./auth";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import {
+  ATOM_TAGS,
+  INLINE_TAGS,
+  SKIP_TAGS,
+  TEXT_ATTRIBUTES,
+  VALUE_INPUT_TYPES,
+  escapeSkeletonText,
+  isMeaningfulText,
+  normalizeSkeleton,
+  skeletonToPlainText,
+} from "./segments";
 
 export interface ExtractedStringItem {
   contentHash: string;
+  /** Skeleton text (see segments.ts). Equal to the escaped plain text when there is no inline markup. */
   sourceText: string;
   wordCount: number;
   contextHint: string;
   domSelector: string;
   occurrenceIndex: number;
+  occurrences: number;
 }
 
 export interface ExtractionResult {
   url: string;
+  finalUrl: string;
   title: string;
   stringCount: number;
+  totalOccurrences: number;
   strings: ExtractedStringItem[];
+  links: string[];
   durationMs: number;
+  likelyClientRendered: boolean;
 }
 
-// Built-in HTML for simulated local websites
-const DEMO_LOCAL_HTML = `
-<!DOCTYPE html>
-<html>
-<head><title>Apex Global Technology</title></head>
-<body>
-  <h1>Welcome to our website. We provide fast and reliable web translation.</h1>
-  <p>Our mission is to break language barriers across the global web.</p>
-  <button>Contact our support team for help.</button>
-  <h2>Cloud Infrastructure and Localization Solutions</h2>
-  <h3>Autonomous Translation</h3>
-  <p>Translate your website in minutes without paid APIs. High performance, zero recurring per-character fees.</p>
-  <h3>Full RTL Script Support</h3>
-  <p>Native right-to-left layout alignment for Arabic and Urdu with automatic typography adjustments.</p>
-  <h3>Review & Human Approval</h3>
-  <button>Save Changes</button>
-  <p>Read our privacy policy and terms of service.</p>
-</body>
-</html>
-`;
+const EXTRACTION_TIMEOUT_MS = Number(process.env.EXTRACTION_TIMEOUT_MS) || 6000;
+const EXTRACTION_MAX_SIZE_BYTES = Number(process.env.EXTRACTION_MAX_SIZE_BYTES) || 5 * 1024 * 1024;
 
-/**
- * Validates a URL against SSRF attack vectors
- */
+// ---------------------------------------------------------------------------
+// SSRF validation
+// ---------------------------------------------------------------------------
+
 function isAlwaysBlockedAddress(address: string): boolean {
   const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
 
   if (isIP(normalized) === 4) {
     const [first, second] = normalized.split(".").map(Number);
+    // 0.0.0.0/8, loopback, link-local + cloud metadata (169.254.169.254), multicast/reserved
     return first === 0 || first === 127 || (first === 169 && second === 254) || first >= 224;
   }
 
@@ -98,7 +106,10 @@ function privateHostIsAllowed(url: URL): boolean {
 /** Validates URL syntax, DNS results, and private-network policy before fetching. */
 export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean; error?: string; parsedUrl?: URL }> {
   try {
-    const parsed = new URL(rawUrl);
+    if (typeof rawUrl !== "string" || rawUrl.length > 2048) {
+      return { valid: false, error: "Please enter a valid website URL." };
+    }
+    const parsed = new URL(rawUrl.trim());
 
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return { valid: false, error: "Only http:// and https:// URLs are permitted." };
@@ -110,24 +121,19 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
       return { valid: false, error: "URLs containing usernames or passwords are not permitted." };
     }
 
-    // Allow mock demo host for local simulation
-    if (hostname === "demo.weblingo.local") {
-      return { valid: true, parsedUrl: parsed };
-    }
-
-    // In development, allow localhost:3000 (the app itself) so local demo sites
-    // can be extracted/tested, while still blocking other loopback ports (SSRF).
+    // In development only, allow this app's own port so the bundled demo pages
+    // (public/demo/*) can be extracted locally. Other loopback ports stay blocked.
     const isDev = process.env.NODE_ENV !== "production";
     const appPort = process.env.PORT || "3000";
     if (isDev && (hostname === "localhost" || hostname === "127.0.0.1")) {
       const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      if (port === appPort || port === "3000") {
+      if (port === appPort) {
         return { valid: true, parsedUrl: parsed };
       }
     }
 
-    if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
-      return { valid: false, error: `Access to internal host '${hostname}' is blocked for SSRF security.` };
+    if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) {
+      return { valid: false, error: `Access to internal host '${hostname}' is blocked for security reasons.` };
     }
 
     let addresses: { address: string }[];
@@ -136,7 +142,7 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
         ? [{ address: hostname }]
         : await lookup(hostname, { all: true, verbatim: true });
     } catch {
-      return { valid: false, error: `Unable to resolve target host '${hostname}'.` };
+      return { valid: false, error: `Unable to resolve website host '${hostname}'. Check the address.` };
     }
     if (!addresses.length) return { valid: false, error: `Host '${hostname}' did not resolve to an IP address.` };
 
@@ -144,7 +150,7 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
     const allowListedPrivateHost = privateHostIsAllowed(parsed);
     for (const { address } of addresses) {
       if (isAlwaysBlockedAddress(address)) {
-        return { valid: false, error: `Access to internal host '${hostname}' is blocked for SSRF security.` };
+        return { valid: false, error: `Access to internal host '${hostname}' is blocked for security reasons.` };
       }
       if (isPrivateAddress(address) && !allowPrivateIps && !allowListedPrivateHost) {
         return {
@@ -156,179 +162,323 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
 
     return { valid: true, parsedUrl: parsed };
   } catch {
-    return { valid: false, error: "Invalid URL format." };
+    return { valid: false, error: "Invalid URL format. Example: https://example.com" };
   }
 }
 
-/**
- * Strips HTML tags and entities to return clean text
- */
-function cleanTextContent(raw: string): string {
-  return raw
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, " ")
-    .trim();
+// ---------------------------------------------------------------------------
+// Segmentation (mirror of public/widget.js — keep both in sync)
+// ---------------------------------------------------------------------------
+
+function tagOf(el: HTMLElement): string {
+  return (el.rawTagName || "").toLowerCase();
 }
 
-/**
- * Extracts translatable content blocks from raw HTML text
- */
-export function extractTranslatableText(html: string, pageUrl: string): ExtractionResult {
-  const tStart = performance.now();
+function isExcluded(el: HTMLElement): boolean {
+  const tag = tagOf(el);
+  if (SKIP_TAGS.has(tag)) return true;
+  if (el.hasAttribute("hidden") || el.hasAttribute("data-no-translate")) return true;
+  if ((el.getAttribute("translate") || "").toLowerCase() === "no") return true;
+  if (/(^|\s)notranslate(\s|$)/.test(el.getAttribute("class") || "")) return true;
+  if (tag === "input" && (el.getAttribute("type") || "").toLowerCase() === "hidden") return true;
+  const style = (el.getAttribute("style") || "").toLowerCase().replace(/\s+/g, "");
+  if (style.includes("display:none") || style.includes("visibility:hidden")) return true;
+  return false;
+}
 
-  // Extract page title
-  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  const title = titleMatch ? cleanTextContent(titleMatch[1]) : "Extracted Page";
+type ChildKind = "text" | "inline" | "atom" | "block" | "skip" | "ignore";
 
-  // Remove scripts, styles, noscript, svg, code blocks
-  let sanitized = html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
-    .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, " ")
-    .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, " ")
-    .replace(/<code\b[^<]*(?:(?!<\/code>)<[^<]*)*<\/code>/gi, " ")
-    .replace(/<pre\b[^<]*(?:(?!<\/pre>)<[^<]*)*<\/pre>/gi, " ");
+function classify(node: ParsedNode): ChildKind {
+  if (node.nodeType === NodeType.TEXT_NODE) return "text";
+  // Comments and other node types are invisible and never split a sentence.
+  if (node.nodeType !== NodeType.ELEMENT_NODE) return "ignore";
+  const el = node as HTMLElement;
+  const tag = tagOf(el);
+  if (INLINE_TAGS.has(tag) && isExcluded(el)) return "atom";
+  if (ATOM_TAGS.has(tag)) return "atom";
+  if (isExcluded(el)) return "skip";
+  if (INLINE_TAGS.has(tag) && isInlineOnly(el)) return "inline";
+  return "block";
+}
 
-  // Target translatable tags
-  const elementRegex = /<(h[1-6]|p|a|button|li|label|span|td|th)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+function isInlineOnly(el: HTMLElement): boolean {
+  for (const child of el.childNodes) {
+    const kind = classify(child);
+    if (kind === "block" || kind === "skip") return false;
+  }
+  return true;
+}
 
-  const foundStrings: ExtractedStringItem[] = [];
-  const seenHashes = new Set<string>();
-  let match: RegExpExecArray | null;
-  let index = 0;
+function buildSkeleton(nodes: ParsedNode[], counter: { n: number }): string {
+  let out = "";
+  for (const node of nodes) {
+    const kind = classify(node);
+    if (kind === "text") {
+      out += escapeSkeletonText(node.text);
+    } else if (kind === "atom") {
+      counter.n += 1;
+      out += `<g${counter.n}></g${counter.n}>`;
+    } else if (kind === "inline") {
+      counter.n += 1;
+      const k = counter.n;
+      out += `<g${k}>` + buildSkeleton((node as HTMLElement).childNodes, counter) + `</g${k}>`;
+    }
+  }
+  return out;
+}
 
-  while ((match = elementRegex.exec(sanitized)) !== null) {
-    const tagName = match[1].toLowerCase();
-    const attributes = match[2] || "";
-    const innerContent = match[3] || "";
+interface RawSegment {
+  skeleton: string;
+  context: string;
+}
 
-    // Skip elements marked not to translate
-    if (/data-no-translate|translate=["']no["']/i.test(attributes)) {
+function significant(nodes: ParsedNode[]): ParsedNode[] {
+  return nodes.filter((n) => !(n.nodeType === NodeType.TEXT_NODE && !n.text.trim()));
+}
+
+function flushRun(run: ParsedNode[], container: HTMLElement, out: RawSegment[]) {
+  if (!run.length) return;
+  const sig = significant(run);
+  if (!sig.some((n) => n.nodeType === NodeType.TEXT_NODE)) {
+    // No loose text, only inline elements (e.g. <li><a>Home</a></li> or a nav
+    // of links): each element is its own unit, translated inside the element.
+    for (const n of sig) if (classify(n) === "inline") processContainer(n as HTMLElement, out);
+    return;
+  }
+  const skeleton = normalizeSkeleton(buildSkeleton(run, { n: 0 }));
+  if (!skeleton) return;
+  if (!isMeaningfulText(skeletonToPlainText(skeleton))) return;
+  out.push({ skeleton, context: tagOf(container) || "text" });
+}
+
+function processContainer(container: HTMLElement, out: RawSegment[]) {
+  let run: ParsedNode[] = [];
+  for (const child of container.childNodes) {
+    const kind = classify(child);
+    if (kind === "text" || kind === "inline" || kind === "atom") {
+      run.push(child);
+    } else if (kind !== "ignore") {
+      flushRun(run, container, out);
+      run = [];
+      if (kind === "block") processContainer(child as HTMLElement, out);
+    }
+  }
+  flushRun(run, container, out);
+}
+
+function pushAttribute(out: RawSegment[], value: string, context: string) {
+  const skeleton = normalizeSkeleton(escapeSkeletonText(value));
+  if (skeleton) out.push({ skeleton, context });
+}
+
+function collectAttributes(root: HTMLElement, out: RawSegment[]) {
+  const walk = (el: HTMLElement) => {
+    for (const child of el.childNodes) {
+      if (child.nodeType !== NodeType.ELEMENT_NODE) continue;
+      const c = child as HTMLElement;
+      const tag = tagOf(c);
+      const excluded = isExcluded(c);
+      // img/input are opaque inside sentences but their attributes are visible.
+      if (!excluded || (!SKIP_TAGS.has(tag) && (tag === "img" || tag === "input") && !isNoTranslate(c))) {
+        for (const attr of TEXT_ATTRIBUTES) {
+          const v = c.getAttribute(attr);
+          if (v) pushAttribute(out, v, `${tag}@${attr}`);
+        }
+        if (tag === "input" && VALUE_INPUT_TYPES.has((c.getAttribute("type") || "").toLowerCase())) {
+          const v = c.getAttribute("value");
+          if (v) pushAttribute(out, v, "input@value");
+        }
+      }
+      if (!excluded) walk(c);
+    }
+  };
+  walk(root);
+}
+
+function isNoTranslate(el: HTMLElement): boolean {
+  return (
+    el.hasAttribute("data-no-translate") ||
+    (el.getAttribute("translate") || "").toLowerCase() === "no" ||
+    /(^|\s)notranslate(\s|$)/.test(el.getAttribute("class") || "")
+  );
+}
+
+/** Extracts translatable segments from raw HTML. Tolerates malformed HTML. */
+export function extractTranslatableText(html: string, pageUrl: string, finalUrl = pageUrl): ExtractionResult {
+  const started = performance.now();
+  const root = parse(html, {
+    comment: false,
+    lowerCaseTagName: false,
+    blockTextElements: { script: true, noscript: true, style: true, pre: true, textarea: true },
+  });
+
+  const titleEl = root.querySelector("title");
+  const title = titleEl ? normalizeSkeleton(titleEl.text) : "";
+  const body = (root.querySelector("body") || root) as HTMLElement;
+
+  const raw: RawSegment[] = [];
+  if (title && isMeaningfulText(title)) raw.push({ skeleton: escapeSkeletonText(title), context: "title" });
+  processContainer(body, raw);
+  collectAttributes(body, raw);
+
+  const byHash = new Map<string, ExtractedStringItem>();
+  let order = 0;
+  for (const seg of raw) {
+    if (!seg.skeleton || seg.skeleton.length > 5000) continue;
+    const plain = skeletonToPlainText(seg.skeleton);
+    if (!isMeaningfulText(plain)) continue;
+    const contentHash = hashSourceText(seg.skeleton);
+    const existing = byHash.get(contentHash);
+    if (existing) {
+      existing.occurrences += 1;
       continue;
     }
+    byHash.set(contentHash, {
+      contentHash,
+      sourceText: seg.skeleton,
+      wordCount: plain.split(/\s+/).filter(Boolean).length,
+      contextHint: seg.context.slice(0, 100),
+      domSelector: seg.context.slice(0, 100),
+      occurrenceIndex: order++,
+      occurrences: 1,
+    });
+  }
 
-    const text = cleanTextContent(innerContent);
-
-    // Filter out very short strings (e.g. single symbols, numbers only)
-    if (!text || text.length < 2 || /^[\d\s.,:;!?#@$%&*()_+=\-[\]{}|\\]+$/.test(text)) {
-      continue;
-    }
-
-    const contentHash = hashSourceText(text);
-
-    if (!seenHashes.has(contentHash)) {
-      seenHashes.add(contentHash);
-      foundStrings.push({
-        contentHash,
-        sourceText: text,
-        wordCount: text.split(/\s+/).filter(Boolean).length,
-        contextHint: tagName,
-        domSelector: tagName,
-        occurrenceIndex: index++,
-      });
+  // Same-origin links, for whole-site discovery.
+  const links = new Set<string>();
+  let base: URL | null = null;
+  try {
+    base = new URL(finalUrl);
+  } catch {
+    base = null;
+  }
+  if (base) {
+    for (const a of root.querySelectorAll("a[href]")) {
+      try {
+        const u = new URL(a.getAttribute("href") || "", base);
+        if (u.origin !== base.origin) continue;
+        if (/\.(pdf|jpe?g|png|gif|webp|svg|zip|mp4|mp3|docx?|xlsx?|pptx?|css|js|xml|json)$/i.test(u.pathname)) continue;
+        u.hash = "";
+        u.search = "";
+        links.add(u.toString());
+      } catch {
+        // ignore invalid hrefs
+      }
     }
   }
 
-  // Also include the page title as a translatable element if present
-  if (title && title !== "Extracted Page") {
-    const titleHash = hashSourceText(title);
-    if (!seenHashes.has(titleHash)) {
-      foundStrings.unshift({
-        contentHash: titleHash,
-        sourceText: title,
-        wordCount: title.split(/\s+/).filter(Boolean).length,
-        contextHint: "title",
-        domSelector: "title",
-        occurrenceIndex: 0,
-      });
-    }
-  }
+  const strings = [...byHash.values()];
+  const scriptCount = root.querySelectorAll("script").length;
+  const likelyClientRendered =
+    strings.length < 8 &&
+    (scriptCount >= 3 || !!root.querySelector("#root, #app, #__next, [data-reactroot], app-root"));
 
   return {
     url: pageUrl,
-    title,
-    stringCount: foundStrings.length,
-    strings: foundStrings,
-    durationMs: Math.round(performance.now() - tStart),
+    finalUrl,
+    title: title || "Untitled page",
+    stringCount: strings.length,
+    totalOccurrences: strings.reduce((n, s) => n + s.occurrences, 0),
+    strings,
+    links: [...links],
+    durationMs: Math.round(performance.now() - started),
+    likelyClientRendered,
   };
 }
 
-/**
- * Safely fetches a remote webpage and extracts translatable content
- */
-export async function fetchAndExtractPage(rawUrl: string): Promise<ExtractionResult> {
+// ---------------------------------------------------------------------------
+// Safe fetching
+// ---------------------------------------------------------------------------
+
+/** Fetches HTML with SSRF checks on every redirect hop, a size cap and a timeout. */
+export async function safeFetchHtml(rawUrl: string, timeoutMs = EXTRACTION_TIMEOUT_MS): Promise<{ html: string; finalUrl: string }> {
   const validation = await validateSafeUrl(rawUrl);
   if (!validation.valid || !validation.parsedUrl) {
     throw new Error(validation.error || "Invalid URL");
   }
+  const deadline = Date.now() + timeoutMs;
+  let currentUrl = validation.parsedUrl;
+  let response: Response | undefined;
 
-  const hostname = validation.parsedUrl.hostname.toLowerCase();
-
-  // If testing simulated demo domain, return demo HTML directly
-  if (hostname === "demo.weblingo.local") {
-    return extractTranslatableText(DEMO_LOCAL_HTML, rawUrl);
-  }
-
-  try {
-    let currentUrl = validation.parsedUrl;
-    let response: Response | undefined;
-
-    for (let redirectCount = 0; redirectCount <= 5; redirectCount++) {
+  for (let hop = 0; hop <= 5; hop++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("The website took too long to respond.");
+    try {
       response = await fetch(currentUrl, {
         method: "GET",
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 WebLingoBot/1.0",
+          Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+          "Accept-Language": "en;q=0.9,*;q=0.5",
         },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(remaining),
         redirect: "manual",
+        cache: "no-store",
       });
-
-      if (![301, 302, 303, 307, 308].includes(response.status)) break;
-      const location = response.headers.get("location");
-      if (!location || redirectCount === 5) {
-        throw new Error("The page redirected too many times or returned an invalid redirect.");
-      }
-
-      const nextUrl = new URL(location, currentUrl);
-      const redirectValidation = await validateSafeUrl(nextUrl.toString());
-      await response.body?.cancel();
-      if (!redirectValidation.valid || !redirectValidation.parsedUrl) {
-        throw new Error(redirectValidation.error || "Redirect target is not allowed.");
-      }
-      currentUrl = redirectValidation.parsedUrl;
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "TimeoutError" || name === "AbortError") throw new Error("The website took too long to respond.");
+      const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : "";
+      throw new Error(`Could not connect to the website${cause ? ` (${cause})` : ""}.`);
     }
-
-    if (!response) throw new Error("No response received from the target page.");
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch page: HTTP ${response.status} ${response.statusText}`);
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/html") && !contentType.includes("application/xhtml")) {
-      throw new Error(`Unsupported content type: ${contentType}. Expected HTML.`);
-    }
-
-    // Enforce 5 MB maximum size limit
-    const html = await response.text();
-    if (html.length > 5 * 1024 * 1024) {
-      throw new Error("Page response size exceeds safe limit of 5 MB.");
-    }
-
-    return extractTranslatableText(html, rawUrl);
-  } catch (err) {
-    // If external fetch fails on unroutable or test domain, check if it was example.com
-    if (hostname === "example.com") {
-      const fallbackHtml = `<html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents.</p><p><a href="https://www.iana.org/domains/example">More information...</a></p></body></html>`;
-      return extractTranslatableText(fallbackHtml, rawUrl);
-    }
-    throw new Error(`Unable to fetch URL '${rawUrl}': ${err instanceof Error ? err.message : String(err)}`);
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    const location = response.headers.get("location");
+    await response.body?.cancel();
+    if (!location || hop === 5) throw new Error("The page redirected too many times or returned an invalid redirect.");
+    const next = await validateSafeUrl(new URL(location, currentUrl).toString());
+    if (!next.valid || !next.parsedUrl) throw new Error(next.error || "Redirect target is not allowed.");
+    currentUrl = next.parsedUrl;
   }
+
+  if (!response) throw new Error("No response received from the website.");
+  if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 503) {
+    await response.body?.cancel();
+    throw new Error(`The website refused automated access (HTTP ${response.status}). It may block bots, rate-limit, or require login.`);
+  }
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`The website returned HTTP ${response.status} ${response.statusText}.`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType && !/text\/html|application\/xhtml/i.test(contentType)) {
+    await response.body?.cancel();
+    throw new Error(`Unsupported content type '${contentType}'. Expected an HTML page.`);
+  }
+  const declared = Number(response.headers.get("content-length") || 0);
+  if (declared > EXTRACTION_MAX_SIZE_BYTES) {
+    await response.body?.cancel();
+    throw new Error("The page is larger than the 5 MB safety limit.");
+  }
+
+  // Stream the body so oversized pages are cut off early.
+  const reader = response.body?.getReader();
+  if (!reader) return { html: "", finalUrl: currentUrl.toString() };
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > EXTRACTION_MAX_SIZE_BYTES) {
+      await reader.cancel();
+      throw new Error("The page is larger than the 5 MB safety limit.");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  const charset = /charset=([^;]+)/i.exec(contentType)?.[1]?.trim().replace(/"/g, "") || "utf-8";
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset);
+  } catch {
+    decoder = new TextDecoder("utf-8");
+  }
+  return { html: decoder.decode(Buffer.concat(chunks)), finalUrl: currentUrl.toString() };
+}
+
+/** Safely fetches a webpage and extracts its translatable content. */
+export async function fetchAndExtractPage(rawUrl: string, timeoutMs?: number): Promise<ExtractionResult> {
+  const { html, finalUrl } = await safeFetchHtml(rawUrl, timeoutMs);
+  return extractTranslatableText(html, rawUrl, finalUrl);
 }

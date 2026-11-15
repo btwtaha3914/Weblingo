@@ -1,5 +1,5 @@
 {
-  "name": "nextjs-postgresql-template",
+  "name": "weblingo",
   "private": true,
   "engines": {
     "node": ">=18.18.0"
@@ -13,7 +13,9 @@
     "db:push": "drizzle-kit push",
     "db:seed": "tsx src/db/run-seed.ts",
     "db:clear": "tsx src/db/clear-db.ts",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "db:purge-fallbacks": "tsx src/db/purge-fallbacks.ts",
+    "test:extract": "tsx tests/extractor.test.ts"
   },
   "dependencies": {
     "@tailwindcss/postcss": "4.1.17",
@@ -24,6 +26,7 @@
     "dotenv": "17.3.1",
     "drizzle-orm": "0.45.2",
     "next": "16.2.6",
+    "node-html-parser": "^7.0.1",
     "pg": "8.20.0",
     "postcss": "8.5.8",
     "react": "19.2.6",

@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { projects, projectDomains, installationTokens, auditEvents } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
 import crypto from "crypto";
+import { getUserIdFromRequest } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -35,7 +36,8 @@ export async function POST(request: Request) {
     }
 
     // Default to owner ID 1 (demo user) if no custom auth header is set
-    const userId = 1;
+    // Signed-in user owns the project; falls back to the seeded owner (id 1) in single-tenant mode.
+    const userId = getUserIdFromRequest(request) ?? 1;
     const apiKey = "wl_" + crypto.randomBytes(24).toString("hex");
 
     const [newProj] = await db

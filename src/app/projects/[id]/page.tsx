@@ -151,7 +151,7 @@ export default async function ProjectWorkspacePage(props: {
         {/* Quick Webpage Translate Bar within this project */}
         <div className="space-y-3">
           <h2 className="text-lg font-bold text-slate-900">Add & Translate Webpage</h2>
-          <QuickTranslateBar projectId={project.id} apiKey={project.apiKey} />
+          <QuickTranslateBar projectId={project.id} apiKey={project.apiKey} defaultLanguages={langs} />
         </div>
 
         {/* Monitored Pages List */}
@@ -201,7 +201,7 @@ export default async function ProjectWorkspacePage(props: {
               All extracted strings are auto-approved. Click &quot;Edit&quot; on any line to modify or customize phrasing.
             </p>
           </div>
-          <TranslationEditor projectId={project.id} />
+          <TranslationEditor projectId={project.id} languages={langs} />
         </div>
 
         {/* Embed Widget Snippet */}

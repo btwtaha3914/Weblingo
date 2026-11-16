@@ -28,16 +28,16 @@ export default async function HomePage() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="text-center max-w-3xl mx-auto space-y-5">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200">
-              <span>🚀</span>
-              <span>Zero-Paid-API Website Localization Platform</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-600" aria-hidden="true" />
+              <span>Self-hosted translation with LibreTranslate</span>
             </div>
 
-            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold text-slate-900 tracking-tight leading-[1.12]">
-              Translate Your Entire Website into Multiple Languages
+            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold text-slate-900 tracking-tight leading-[1.1] text-balance">
+              Translate your whole website into many languages at once
             </h1>
 
-            <p className="text-base sm:text-lg text-slate-600 leading-relaxed max-w-2xl mx-auto">
-              Extract, translate, and deliver multilingual website experiences with native RTL support for Arabic and Urdu. Add a single 1-line script tag to your header and let visitors switch languages in real-time.
+            <p className="text-base sm:text-lg text-slate-600 leading-relaxed max-w-2xl mx-auto text-pretty">
+              Paste a URL, pick your languages, and WebLingo extracts the visible text and translates it on your own server. Add one script tag and visitors get a language switcher, with right-to-left layout for Arabic and Urdu.
             </p>
 
             <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
@@ -45,28 +45,27 @@ export default async function HomePage() {
                 href="#translator"
                 className="px-6 py-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold text-sm rounded-xl shadow-md shadow-blue-500/25 transition-all inline-flex items-center gap-2 cursor-pointer"
               >
-                <span>Translate a Webpage Now</span>
-                <span>↓</span>
+                <span>Translate a website</span>
+                <span aria-hidden="true">↓</span>
               </a>
 
               <Link
                 href="/projects"
                 className="px-6 py-3 bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 font-semibold text-sm rounded-xl border border-slate-300 shadow-xs transition-all inline-flex items-center gap-2"
               >
-                <span>Manage Projects</span>
-                <span>→</span>
+                <span>Manage projects</span>
+                <span aria-hidden="true">→</span>
               </Link>
             </div>
 
             {/* Language badges */}
             <div className="pt-4 flex flex-wrap items-center justify-center gap-2 text-xs text-slate-500">
-              <span className="font-medium text-slate-600">Built-in Support:</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇪🇸 Spanish</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇸🇦 Arabic (RTL)</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇵🇰 Urdu (RTL)</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇫🇷 French</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇩🇪 German</span>
-              <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">🇮🇹 Italian</span>
+              <span className="font-medium text-slate-600">40+ languages, including</span>
+              {["Spanish", "French", "German", "Arabic", "Urdu", "Chinese", "Hindi"].map((name) => (
+                <span key={name} className="px-2 py-0.5 rounded-md bg-white border border-slate-200 font-medium text-slate-700">
+                  {name}
+                </span>
+              ))}
             </div>
           </div>
         </div>
@@ -79,6 +78,7 @@ export default async function HomePage() {
           <QuickTranslateBar
             projectId={activeProject?.id}
             apiKey={activeProject?.apiKey}
+            defaultLanguages={(activeProject?.targetLanguages as string[] | undefined) ?? undefined}
           />
         </div>
 
@@ -145,7 +145,7 @@ export default async function HomePage() {
             </div>
           </div>
 
-          <TranslationEditor projectId={activeProject ? activeProject.id : 1} />
+          <TranslationEditor projectId={activeProject ? activeProject.id : 1} languages={(activeProject?.targetLanguages as string[] | undefined) ?? undefined} />
         </section>
 
         {/* How It Works Section */}

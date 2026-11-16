@@ -90,37 +90,45 @@ export async function runJobToCompletion(
 ): Promise<JobState> {
   let stalled = 0;
   let lastRemaining = Number.POSITIVE_INFINITY;
+  // Batch size suggested by the server after each step (carried here because
+  // serverless instances do not share memory).
+  let batchSize: number | undefined;
   for (;;) {
     if (opts.signal?.aborted) throw new DOMException("Cancelled", "AbortError");
     const res = await fetch(`/api/jobs/${jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ autoApprove: opts.autoApprove !== false }),
+      body: JSON.stringify({ autoApprove: opts.autoApprove !== false, batchSize }),
       signal: opts.signal,
     });
-    let data: { ok?: boolean; error?: string; job?: JobState } = {};
+    let data: { ok?: boolean; error?: string; job?: JobState; nextBatchSize?: number } = {};
     try {
       data = await res.json();
     } catch {
       data = {};
     }
     if (!res.ok || !data.job) {
-      // 502/504 from the host means a step overran the function limit: retry a few times.
-      if ((res.status === 502 || res.status === 504) && stalled < 3) {
+      // 502/504 from the host means a step overran the function limit:
+      // retry with a smaller batch.
+      if ((res.status === 502 || res.status === 504) && stalled < 4) {
         stalled++;
+        batchSize = Math.max(1, Math.floor((batchSize ?? 6) / 2));
         continue;
       }
       throw new Error(data.error || `Translation step failed (HTTP ${res.status}).`);
     }
     const job = data.job;
+    if (typeof data.nextBatchSize === "number") batchSize = data.nextBatchSize;
     opts.onProgress?.(job);
     if (job.status === "completed" || job.status === "completed_with_errors" || job.status === "failed") return job;
     if (job.remaining >= lastRemaining) {
+      // No progress: the server is shrinking the batch after a timeout, or is busy.
+      // Allow enough attempts for the batch to shrink to a single string.
       stalled++;
-      if (stalled >= 4) {
+      if (stalled >= 8) {
         throw new Error(job.lastError ? `Translation is not progressing: ${job.lastError}` : "Translation is not progressing. Check the LibreTranslate server.");
       }
-      await new Promise((r) => setTimeout(r, 1500 * stalled));
+      await new Promise((r) => setTimeout(r, Math.min(4000, 750 * stalled)));
     } else {
       stalled = 0;
     }

@@ -102,6 +102,9 @@ export function QuickTranslateBar({
     authorized: false,
   });
   const abortRef = useRef<AbortController | null>(null);
+  const currentPageRef = useRef<number | null>(null);
+  // Page of the last single-page run (null for whole-site runs), used by "Retry failed languages".
+  const [lastPageId, setLastPageId] = useState<number | null>(null);
 
   useEffect(() => {
     fetch("/api/languages")
@@ -140,6 +143,90 @@ export function QuickTranslateBar({
   };
 
   const cancel = () => abortRef.current?.abort();
+
+  type CreatedJob = { id: number; total: number; targetLanguage: string; pageId?: number | null };
+  const pageIdOf = (jobs: CreatedJob[]) => jobs.find((j) => j.pageId)?.pageId ?? currentPageRef.current;
+
+  /**
+   * Runs language jobs one after another (LibreTranslate is CPU-bound, so
+   * parallel requests would not be faster), updating per-language progress.
+   */
+  const runLanguageJobs = async (jobs: CreatedJob[], signal: AbortSignal, withRows: boolean) => {
+    const results: { lang: string; job: JobState | null; error?: string }[] = [];
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i];
+      const label = `${langName(j.targetLanguage)} (${i + 1} of ${jobs.length})`;
+      stage("translate", "active", j.total ? `${label}: 0 / ${j.total} strings` : `${label}: already translated`);
+      try {
+        const finalJob = await runJobToCompletion(j.id, {
+          signal,
+          onProgress: (s) => {
+            setJob(s);
+            setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: s, error: undefined } : x)));
+            stage("translate", "active", `${label}: ${s.done} / ${s.total} strings${s.failed ? ` (${s.failed} failed)` : ""}`);
+          },
+        });
+        setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: finalJob, error: undefined } : x)));
+        if (finalJob.status === "failed") throw new Error(finalJob.lastError || "Translation failed.");
+        results.push({ lang: j.targetLanguage, job: finalJob });
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, error: msg } : x)));
+        results.push({ lang: j.targetLanguage, job: null, error: msg });
+      }
+      if (withRows) {
+        const res = await fetch(`/api/jobs/${j.id}?strings=1`, { signal });
+        const data = await res.json();
+        if (res.ok && Array.isArray(data.strings)) setRowsByLang((prev) => ({ ...prev, [j.targetLanguage]: data.strings }));
+      }
+    }
+    const allOk = results.every((r) => r.job && !r.job.failed && !r.error);
+    stage(
+      "translate",
+      allOk ? "done" : "error",
+      results
+        .map((r) => `${langName(r.lang)}: ${r.error ? "failed" : `${r.job!.done}/${r.job!.total}${r.job!.failed ? `, ${r.job!.failed} failed` : ""}`}`)
+        .join(" · ")
+    );
+    return results;
+  };
+
+  /** Re-runs only the languages that failed or have failed strings; finished work is kept. */
+  const retryFailed = async () => {
+    const langs = langJobs.filter((lj) => lj.error || (lj.state && lj.state.failed > 0)).map((lj) => lj.lang);
+    if (!langs.length || !projectId) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setRunning(true);
+    setError(null);
+    setWarning(null);
+    try {
+      const created = await postJSON<{ jobs: CreatedJob[] }>(
+        "/api/jobs",
+        { projectId, targetLanguages: langs, pageId: lastPageId ?? undefined },
+        controller.signal
+      );
+      // Replace the failed entries with the new jobs, keep the successful ones.
+      setLangJobs((prev) =>
+        prev.map((lj) => {
+          const nj = created.jobs.find((j) => j.targetLanguage === lj.lang);
+          return nj ? { lang: lj.lang, id: nj.id, state: null } : lj;
+        })
+      );
+      const results = await runLanguageJobs(created.jobs, controller.signal, lastPageId !== null);
+      const stillFailed = results.filter((r) => r.error);
+      if (stillFailed.length) {
+        setWarning(`Still failing:\n${stillFailed.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n")}`);
+      }
+    } catch (err) {
+      const aborted = err instanceof DOMException && err.name === "AbortError";
+      setError(aborted ? "Cancelled. Translations finished so far are saved." : err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunning(false);
+      abortRef.current = null;
+    }
+  };
 
   const handleTranslate = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -182,6 +269,7 @@ export function QuickTranslateBar({
           likelyClientRendered: boolean;
           jobs: { id: number; total: number; targetLanguage: string }[];
         }>("/api/translate-page", { url: url.trim(), projectId, targetLanguages: langs }, signal);
+        currentPageRef.current = data.page.id;
         stage("connect", "done", new URL(data.page.urlPath).host);
         stage("extract", "done", `${data.extractedCount} text items, ${data.uniqueCount} unique`);
         if (data.likelyClientRendered) setWarning("This page builds most of its content with JavaScript, so some text may be missing. Install the widget and visit the page: it reports text it finds, and you can translate it from the editor below.");
@@ -244,52 +332,16 @@ export function QuickTranslateBar({
         jobs = created.jobs;
       }
 
-      // LibreTranslate is CPU-bound, so languages are translated one after another.
       current = "translate";
+      setLastPageId(wholeSite ? null : pageIdOf(jobs));
       setLangJobs(jobs.map((j) => ({ lang: j.targetLanguage, id: j.id, state: null })));
-      const results: { lang: string; job: JobState | null; error?: string }[] = [];
-      for (let i = 0; i < jobs.length; i++) {
-        const j = jobs[i];
-        const label = `${langName(j.targetLanguage)} (${i + 1} of ${jobs.length})`;
-        stage("translate", "active", j.total ? `${label}: 0 / ${j.total} strings` : `${label}: already translated`);
-        try {
-          const finalJob = await runJobToCompletion(j.id, {
-            signal,
-            onProgress: (s) => {
-              setJob(s);
-              setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: s } : x)));
-              stage("translate", "active", `${label}: ${s.done} / ${s.total} strings${s.failed ? ` (${s.failed} failed)` : ""}`);
-            },
-          });
-          setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: finalJob } : x)));
-          if (finalJob.status === "failed") throw new Error(finalJob.lastError || "Translation failed.");
-          results.push({ lang: j.targetLanguage, job: finalJob });
-        } catch (err) {
-          if (err instanceof DOMException && err.name === "AbortError") throw err;
-          const msg = err instanceof Error ? err.message : String(err);
-          setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, error: msg } : x)));
-          results.push({ lang: j.targetLanguage, job: null, error: msg });
-        }
-        if (!wholeSite) {
-          const res = await fetch(`/api/jobs/${j.id}?strings=1`, { signal });
-          const data = await res.json();
-          if (res.ok && Array.isArray(data.strings)) setRowsByLang((prev) => ({ ...prev, [j.targetLanguage]: data.strings }));
-        }
-      }
-      const okLangs = results.filter((r) => r.job && !r.job.failed && !r.error);
+      const results = await runLanguageJobs(jobs, signal, !wholeSite);
       const failedLangs = results.filter((r) => r.error);
-      stage(
-        "translate",
-        okLangs.length === results.length ? "done" : "error",
-        results
-          .map((r) => `${langName(r.lang)}: ${r.error ? "failed" : `${r.job!.done}/${r.job!.total}${r.job!.failed ? `, ${r.job!.failed} failed` : ""}`}`)
-          .join(" · ")
-      );
       if (failedLangs.length === results.length) {
         throw new Error(failedLangs.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n"));
       }
       if (failedLangs.length) {
-        setWarning(`Some languages could not be translated:\n${failedLangs.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n")}`);
+        setWarning(`Some languages could not be translated. Use “Retry failed languages” to try them again:\n${failedLangs.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n")}`);
       }
       stage("save", "done", "Approved translations saved");
       stage("script", "done", "Ready to install");
@@ -496,6 +548,18 @@ export function QuickTranslateBar({
 
         {warning && (
           <div className="mt-4 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-sm whitespace-pre-line">{warning}</div>
+        )}
+        {!running && langJobs.some((lj) => lj.error || (lj.state && lj.state.failed > 0)) && (
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={retryFailed}
+              className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold shadow-sm transition-colors cursor-pointer"
+            >
+              Retry failed languages
+            </button>
+            <span className="text-xs text-slate-500">Finished translations are kept; only missing or failed strings are sent again.</span>
+          </div>
         )}
         {error && (
           <div role="alert" className="mt-4 p-4 rounded-xl bg-red-50 border border-red-200 text-red-800 text-sm">

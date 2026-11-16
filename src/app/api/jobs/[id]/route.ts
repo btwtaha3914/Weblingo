@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getJobProgress, getPageStrings, runJobStep } from "@/lib/pipeline";
+import { clampBatch, getJobProgress, getPageStrings, runJobStep } from "@/lib/pipeline";
 import { errorResponse, getAccessibleProject, HttpError } from "@/lib/access";
 import { getUserIdFromRequest } from "@/lib/auth";
 
@@ -28,7 +28,7 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
   }
 }
 
-/** Runs one time-boxed translation step. Body: { autoApprove?: boolean } */
+/** Runs one time-boxed translation step. Body: { autoApprove?: boolean, batchSize?: number (the previous step's nextBatchSize) } */
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await ctx.params;
@@ -37,6 +37,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
     const result = await runJobStep(progress.id, {
       autoApprove: body.autoApprove !== false,
       userId: getUserIdFromRequest(request),
+      batchSize: clampBatch(body.batchSize),
     });
     return NextResponse.json({ ok: true, ...result, job: result.progress });
   } catch (err) {

@@ -18,12 +18,14 @@ export function LanguageMultiSelect({
   onChange,
   disabled,
   max = 10,
+  placeholder = "Choose languages…",
 }: {
   languages: LanguageOption[];
   value: string[];
   onChange: (codes: string[]) => void;
   disabled?: boolean;
   max?: number;
+  placeholder?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -73,18 +75,25 @@ export function LanguageMultiSelect({
         className="w-full min-h-[46px] flex items-center gap-1.5 flex-wrap bg-slate-50 border border-slate-300 rounded-xl pl-3 pr-9 py-2 text-left text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-blue-600 disabled:opacity-60 cursor-pointer relative"
       >
         {value.length === 0 ? (
-          <span className="text-slate-400">Choose languages…</span>
+          <span className="text-slate-400">{placeholder}</span>
         ) : (
-          value.map((code) => (
-            <span key={code} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-100 text-blue-800 text-xs font-semibold">
-              {byCode(code)?.name || code}
-            </span>
-          ))
+          <>
+            {value.slice(0, 3).map((code) => (
+              <span key={code} className="inline-flex items-center px-2 py-0.5 rounded-md bg-blue-100 text-blue-800 text-xs font-semibold max-w-[9rem] truncate">
+                {byCode(code)?.name || code}
+              </span>
+            ))}
+            {value.length > 3 && (
+              <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-slate-200 text-slate-700 text-xs font-semibold" title={value.map((c) => byCode(c)?.name || c).join(", ")}>
+                +{value.length - 3} more
+              </span>
+            )}
+          </>
         )}
         <svg className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
         </svg>
-        <span className="sr-only">{value.length} languages selected</span>
+        <span className="sr-only">{value.length} {value.length === 1 ? "language" : "languages"} selected</span>
       </button>
 
       {open && (

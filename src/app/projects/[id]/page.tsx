@@ -137,7 +137,7 @@ export default async function ProjectWorkspacePage(props: {
             <p className="text-2xl font-bold text-slate-900 mt-1">{totalStrings}</p>
           </div>
           <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-xs">
-            <span className="text-slate-500 text-xs font-medium">Approved Translations</span>
+            <span className="text-slate-500 text-xs font-medium">Approved (all languages)</span>
             <p className="text-2xl font-bold text-emerald-600 mt-1">{totalApproved}</p>
           </div>
           <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-xs">

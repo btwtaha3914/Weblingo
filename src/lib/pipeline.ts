@@ -27,17 +27,34 @@ import {
 } from "./engine-manager";
 
 const STEP_BUDGET_MS = Number(process.env.JOB_STEP_BUDGET_MS) || 7000;
+const DEFAULT_MS_PER_SEGMENT = Number(process.env.TRANSLATION_MS_PER_SEGMENT) || 700;
+const MAX_BATCH = 40;
+const DEFAULT_BATCH = 6;
+
 /**
- * Estimated LibreTranslate cost per segment. Starts conservative and adapts to
- * the measured speed of the server (per warm function instance), so each step
- * sends as many segments as safely fit in the time budget.
+ * Batch sizing.
+ *
+ * LibreTranslate speed differs per language (measured on the production
+ * server: es/ar ≈0.4 s, ur ≈0.6 s, fr up to ≈0.9 s per sentence) and with
+ * server load. Serverless instances do not share memory, so the batch size is
+ * carried between steps by the client: every step returns `nextBatchSize`,
+ * computed from what this step actually measured, and the client sends it back
+ * as `batchSize`. A timeout halves it; fast steps grow it.
  */
-let msPerSegment = Number(process.env.TRANSLATION_MS_PER_SEGMENT) || 700;
-function recordSpeed(segments: number, ms: number) {
-  if (segments < 2) return;
-  const measured = ms / segments;
-  // Exponential moving average with a 25% safety margin, clamped to sane bounds.
-  msPerSegment = Math.min(3000, Math.max(120, 0.6 * msPerSegment + 0.4 * measured * 1.25));
+const speedByLanguage = new Map<string, number>(); // warm-instance hint only
+function estimateMsPerSegment(lang: string) {
+  return speedByLanguage.get(lang) ?? DEFAULT_MS_PER_SEGMENT;
+}
+function recordSpeed(lang: string, segments: number, ms: number) {
+  if (segments < 1) return;
+  const measured = (ms / segments) * 1.3; // 30% safety margin
+  const prev = estimateMsPerSegment(lang);
+  speedByLanguage.set(lang, Math.min(5000, Math.max(120, 0.5 * prev + 0.5 * measured)));
+}
+
+export function clampBatch(n: unknown): number | null {
+  const v = Number(n);
+  return Number.isInteger(v) && v >= 1 ? Math.min(v, MAX_BATCH) : null;
 }
 
 export interface StoredString {
@@ -263,8 +280,16 @@ async function saveTranslations(
 /** Runs one time-boxed step of a job. Safe to call repeatedly and concurrently. */
 export async function runJobStep(
   jobId: number,
-  opts: { autoApprove: boolean; userId?: number; budgetMs?: number }
-): Promise<{ progress: JobProgress; translated: number; fromMemory: number; failedNow: number; durationMs: number }> {
+  opts: { autoApprove: boolean; userId?: number; budgetMs?: number; batchSize?: number | null }
+): Promise<{
+  progress: JobProgress;
+  translated: number;
+  fromMemory: number;
+  failedNow: number;
+  durationMs: number;
+  batchSize: number;
+  nextBatchSize: number;
+}> {
   const started = Date.now();
   const deadline = started + Math.min(opts.budgetMs ?? STEP_BUDGET_MS, 20000);
   const job = await db.query.translationJobs.findFirst({ where: eq(translationJobs.id, jobId) });
@@ -279,6 +304,8 @@ export async function runJobStep(
   let fromMemory = 0;
   let failedNow = 0;
   let lastError: string | null = job.errorMessage;
+  let batchSize = 0;
+  let nextBatchSize = opts.batchSize ?? DEFAULT_BATCH;
 
   if (job.status !== "completed" && job.status !== "completed_with_errors") {
     if (job.status === "pending") {
@@ -299,14 +326,37 @@ export async function runJobStep(
       pending = pending.filter((p) => !hitIds.has(p.id));
     }
 
-    // 2) LibreTranslate: as many segments as fit in the remaining time.
-    const capacity = Math.floor((deadline - Date.now() - 800) / msPerSegment);
-    if (pending.length && capacity > 0) {
-      const batch = pending.slice(0, Math.min(capacity, 40));
+    // 2) LibreTranslate: a batch sized to fit the remaining time.
+    const remainingMs = deadline - Date.now() - 800;
+    const fitBySpeed = Math.max(1, Math.floor(remainingMs / estimateMsPerSegment(tgt)));
+    const size = Math.max(1, Math.min(opts.batchSize ?? DEFAULT_BATCH, fitBySpeed, MAX_BATCH));
+    if (pending.length && remainingMs > 1000) {
+      const batch = pending.slice(0, size);
+      batchSize = batch.length;
       try {
         const engineStart = Date.now();
         const results = await translateSegments(batch.map((b) => b.source_text), src, tgt, deadline);
-        recordSpeed(results.filter((r) => r.ok).length, Date.now() - engineStart);
+        const elapsed = Date.now() - engineStart;
+        const okCount = results.filter((r) => r.ok).length;
+        const timedOut = results.some((r) => !r.ok && r.deferred && /timed out|too long/i.test(r.error));
+        recordSpeed(tgt, okCount, elapsed);
+        if (okCount > 0) {
+          // Grow (or shrink) toward what fits in a full step at the measured speed.
+          const perSeg = (elapsed / okCount) * 1.3;
+          const fit = Math.floor((STEP_BUDGET_MS - 1500) / perSeg);
+          nextBatchSize = Math.max(1, Math.min(MAX_BATCH, fit, timedOut ? okCount : batch.length * 2));
+        } else if (timedOut) {
+          nextBatchSize = Math.max(1, Math.floor(batch.length / 2));
+          if (batch.length === 1) {
+            // A single string that cannot be translated within the time limit:
+            // report it instead of retrying forever, so the job keeps moving.
+            results[0] = {
+              ok: false,
+              deferred: false,
+              error: "LibreTranslate took longer than the time limit for this text (it may be very long)",
+            };
+          }
+        }
         const okRows: { stringId: number; text: string; status: string; model: string }[] = [];
         const failRows: { stringId: number; text: string; status: string; model: string }[] = [];
         const memoryRows: { sourceText: string; translatedText: string }[] = [];
@@ -370,7 +420,7 @@ export async function runJobStep(
   }
 
   const progress = (await getJobProgress(jobId))!;
-  return { progress, translated, fromMemory, failedNow, durationMs: Date.now() - started };
+  return { progress, translated, fromMemory, failedNow, durationMs: Date.now() - started, batchSize, nextBatchSize };
 }
 
 /** Segments of one page with their translation for a language (for the results table). */

@@ -133,7 +133,7 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
     }
 
     if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) {
-      return { valid: false, error: `Access to internal host '${hostname}' is blocked for security reasons.` };
+      return { valid: false, error: `Access to internal host '${hostname}' is blocked for SSRF security.` };
     }
 
     let addresses: { address: string }[];
@@ -150,7 +150,7 @@ export async function validateSafeUrl(rawUrl: string): Promise<{ valid: boolean;
     const allowListedPrivateHost = privateHostIsAllowed(parsed);
     for (const { address } of addresses) {
       if (isAlwaysBlockedAddress(address)) {
-        return { valid: false, error: `Access to internal host '${hostname}' is blocked for security reasons.` };
+        return { valid: false, error: `Access to internal host '${hostname}' is blocked for SSRF security.` };
       }
       if (isPrivateAddress(address) && !allowPrivateIps && !allowListedPrivateHost) {
         return {

@@ -38,7 +38,7 @@
 
   var projectKey = attr("data-project-key", attr("data-project-id", ""));
   if (!projectKey) {
-    console.warn("[WebLingo] Missing data-project-key on the widget script tag.");
+    if (window.console) console.error("[WebLingo] Missing data-project-key on the widget script tag. The widget is not running.");
     return;
   }
   var apiBase = attr("data-api-url", "");
@@ -53,6 +53,23 @@
   var defaultLanguage = attr("data-default-language", "");
   var observeChanges = attr("data-observe", "true") !== "false";
   var reportMissing = attr("data-report-missing", "true") !== "false";
+  var debug = attr("data-debug", "true") !== "false";
+
+  // ---------------------------------------------------------------------------
+  // Console logging: every widget action is logged with a [WebLingo] prefix so
+  // site owners can follow what happens. Turn off with data-debug="false".
+  // Errors are always logged.
+  // ---------------------------------------------------------------------------
+  var LOG_STYLE = "color:#fff;background:#2563eb;border-radius:3px;padding:1px 5px;font-weight:600";
+  function log(message, details) {
+    if (!debug || !window.console) return;
+    if (details === undefined) console.info("%cWebLingo%c " + message, LOG_STYLE, "");
+    else console.info("%cWebLingo%c " + message, LOG_STYLE, "", details);
+  }
+  function logError(message, err) {
+    if (window.console) console.error("[WebLingo] " + message, err === undefined ? "" : err);
+  }
+  function since(t0) { return Math.round(performance.now() - t0) + " ms"; }
   var STORAGE_KEY = "weblingo:lang:" + projectKey;
 
   // ---------------------------------------------------------------------------
@@ -407,13 +424,17 @@
     if (value === null) el.removeAttribute(name); else el.setAttribute(name, value);
   }
 
+  /** Translates the segments under root; returns { found, applied, missing } counts. */
   function translateRoot(root) {
-    if (!currentDict) return;
+    var stats = { found: 0, applied: 0, missing: 0 };
+    if (!currentDict) return stats;
     var segments = collectSegments(root);
+    stats.found = segments.length;
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
       var translated = currentDict[sha256(seg.skeleton)];
-      if (!translated) { missing[seg.skeleton] = true; continue; }
+      if (!translated) { missing[seg.skeleton] = true; stats.missing++; continue; }
+      stats.applied++;
       if (seg.kind === "attr") {
         var original = seg.el.getAttribute(seg.name);
         var value = unescapeText(translated);
@@ -423,6 +444,7 @@
         applyRun(seg, translated);
       }
     }
+    return stats;
   }
 
   function translateTitle() {
@@ -486,9 +508,18 @@
         flushTimer = null;
         var roots = Array.from(pendingRoots);
         pendingRoots.clear();
+        var applied = 0, notFound = 0;
         paused(function () {
-          for (var r = 0; r < roots.length; r++) if (roots[r].isConnected) translateRoot(roots[r]);
+          for (var r = 0; r < roots.length; r++) {
+            if (!roots[r].isConnected) continue;
+            var st = translateRoot(roots[r]);
+            applied += st.applied;
+            notFound += st.missing;
+          }
         });
+        if (applied || notFound) {
+          log("New content appeared on the page: translated " + applied + " text item(s)" + (notFound ? ", " + notFound + " without a translation yet" : "") + ".");
+        }
         scheduleMissingReport();
       }, 120);
     }
@@ -519,19 +550,29 @@
   function loadDictionary(lang) {
     var version = languageVersion(lang);
     var memKey = lang + "@" + version;
-    if (dictCache[memKey]) return Promise.resolve(dictCache[memKey]);
+    if (dictCache[memKey]) {
+      log("Using " + langLabel(lang) + " translations already loaded on this page (" + dictCache[memKey].translationsCount + " items).");
+      return Promise.resolve(dictCache[memKey]);
+    }
     var cacheKey = "weblingo:dict:" + projectKey + ":" + memKey;
     try {
       var raw = sessionStorage.getItem(cacheKey);
       if (raw) {
         var parsed = JSON.parse(raw);
-        if (parsed && parsed.targetLanguage === lang) { dictCache[memKey] = parsed; return Promise.resolve(parsed); }
+        if (parsed && parsed.targetLanguage === lang) {
+          dictCache[memKey] = parsed;
+          log("Loaded " + parsed.translationsCount + " " + langLabel(lang) + " translations from this browser's cache (version " + version + ").");
+          return Promise.resolve(parsed);
+        }
       }
     } catch (e) { /* storage unavailable */ }
     var url = apiBase + "/api/widget/p/" + encodeURIComponent(projectKey) + "/t/" + encodeURIComponent(lang) + "/" + encodeURIComponent(version);
+    var t0 = performance.now();
+    log("Downloading " + langLabel(lang) + " translations…", url);
     return getJSON(url).then(function (data) {
       // Never apply a dictionary for a different language than requested.
       if (data.targetLanguage !== lang) throw new Error("Received translations for '" + data.targetLanguage + "' instead of '" + lang + "'");
+      log("Downloaded " + data.translationsCount + " " + langLabel(lang) + " translations in " + since(t0) + ".");
       dictCache[memKey] = data;
       try { sessionStorage.setItem(cacheKey, JSON.stringify(data)); } catch (e) { /* quota */ }
       return data;
@@ -548,12 +589,15 @@
       for (var s in missing) if (!reported[s] && list.length < 50) { list.push(s); reported[s] = true; }
       missing = {};
       if (!list.length) return;
+      log("Reporting " + list.length + " text item(s) with no translation yet to the WebLingo dashboard.", list);
       fetch(apiBase + "/api/widget/missing", {
         method: "POST",
         mode: "cors",
         credentials: "omit",
         headers: { "Content-Type": "text/plain" }, // simple request: no CORS preflight
         body: JSON.stringify({ key: projectKey, url: location.origin + location.pathname, strings: list })
+      }).then(function (res) {
+        if (!res.ok) log("Untranslated text report was not accepted (HTTP " + res.status + ").");
       }).catch(function () { /* reporting is best-effort */ });
     }, 3000);
   }
@@ -564,16 +608,32 @@
   var config = null;
 
   var switchToken = 0;
-  function setLanguage(lang) {
+  function langLabel(code) {
+    var langs = (config && config.languages) || [];
+    for (var i = 0; i < langs.length; i++) if (langs[i].code === code) return langs[i].name + " (" + code + ")";
+    return code;
+  }
+
+  function setLanguage(lang, reason) {
     if (!config) return Promise.resolve();
     var isSource = lang === config.sourceLanguage;
-    if ((isSource && currentLang === null) || lang === currentLang) return Promise.resolve();
+    if ((isSource && currentLang === null) || lang === currentLang) {
+      log(langLabel(lang) + " is already shown; nothing to do.");
+      return Promise.resolve();
+    }
     var token = ++switchToken;
+    var t0 = performance.now();
+    log("Switching to " + langLabel(lang) + (reason ? " (" + reason + ")" : "") + "…");
     ui.setBusy(true);
     var job = isSource ? Promise.resolve(null) : loadDictionary(lang);
     return job.then(function (data) {
       // A newer choice was made while this one was loading: ignore this one.
-      if (token !== switchToken) return;
+      if (token !== switchToken) {
+        log("Skipped " + langLabel(lang) + ": a newer language was chosen while it was loading.");
+        return;
+      }
+      var stats = null;
+      var hadTranslation = currentLang !== null;
       paused(function () {
         restoreAll();
         currentDict = null;
@@ -585,15 +645,24 @@
         document.documentElement.setAttribute("lang", lang);
         document.documentElement.setAttribute("dir", data.isRtl ? "rtl" : "ltr");
         translateTitle();
-        translateRoot(document.body);
+        stats = translateRoot(document.body);
       });
+      if (!data) {
+        log((hadTranslation ? "Restored the original " : "Showing the original ") + langLabel(lang) + " page in " + since(t0) + ".");
+      } else {
+        log(
+          "Translated the page into " + langLabel(lang) + " in " + since(t0) + ": " + stats.applied + " of " + stats.found +
+            " text items" + (stats.missing ? " (" + stats.missing + " have no approved translation yet and stay in the original language)" : "") +
+            ". Direction: " + (data.isRtl ? "right-to-left" : "left-to-right") + "."
+        );
+      }
       try { localStorage.setItem(STORAGE_KEY, lang); } catch (e) { /* storage unavailable */ }
       ui.setCurrent(lang);
       ui.setError("");
       scheduleMissingReport();
     }).catch(function (err) {
       if (token !== switchToken) return;
-      console.error("[WebLingo] Could not load translations:", err);
+      logError("Could not load " + langLabel(lang) + " translations:", err);
       ui.setError("Translation is unavailable right now.");
     }).then(function () { if (token === switchToken) ui.setBusy(false); });
   }
@@ -690,6 +759,7 @@
       options[active].el.focus();
     }
     function open() {
+      if (!isOpen()) log("Language menu opened (" + options.length + " languages).");
       wrap.classList.add("open");
       button.setAttribute("aria-expanded", "true");
       var sel = 0;
@@ -697,13 +767,15 @@
       focusOption(sel);
     }
     function close(refocus) {
+      if (isOpen()) log("Language menu closed.");
       wrap.classList.remove("open");
       button.setAttribute("aria-expanded", "false");
       if (refocus) button.focus();
     }
     function choose(i) {
+      log("Visitor chose " + options[i].lang.name + " (" + options[i].lang.code + ").");
       close(true);
-      setLanguage(options[i].lang.code);
+      setLanguage(options[i].lang.code, "chosen by the visitor");
     }
 
     button.addEventListener("click", function () { if (isOpen()) close(false); else open(); });
@@ -737,22 +809,30 @@
     ui.setError = function (msg) { err.textContent = msg; err.classList.toggle("show", !!msg); if (msg) open(); };
 
     document.body.appendChild(host);
+    log("Language button added to the page (" + position + ").");
   }
 
   // ---------------------------------------------------------------------------
   // Boot
   // ---------------------------------------------------------------------------
   function start() {
+    var t0 = performance.now();
+    log("Widget started.", { project: projectKey.slice(0, 10) + "…", api: apiBase, page: location.href });
     getJSON(apiBase + "/api/widget/p/" + encodeURIComponent(projectKey) + "/config")
       .then(function (cfg) {
         config = cfg;
         var langs = cfg.languages || [];
+        log(
+          "Project \"" + cfg.project + "\" loaded in " + since(t0) + ". Languages with approved translations: " +
+            langs.filter(function (l) { return l.code !== cfg.sourceLanguage; }).map(function (l) { return l.name + " (" + l.count + ")"; }).join(", ") +
+            (langs.length < 2 ? "none" : "") + "."
+        );
         if (langFilter) {
           var wanted = langFilter.split(",").map(function (s) { return s.trim().toLowerCase(); });
           langs = langs.filter(function (l) { return l.code === cfg.sourceLanguage || wanted.indexOf(l.code) !== -1; });
         }
         if (langs.length < 2) {
-          console.info("[WebLingo] No approved translations yet for this project; the switcher is hidden.");
+          log("No approved translations" + (langFilter ? " for data-languages=\"" + langFilter + "\"" : "") + " yet, so the language button is hidden.");
           return;
         }
         buildUI(langs);
@@ -760,16 +840,20 @@
         if (observeChanges && window.MutationObserver) {
           observer = new MutationObserver(onMutations);
           paused(function () {});
+          log("Watching the page for content added later (menus, pop-ups, loaded sections).");
         }
         var saved = null;
         try { saved = localStorage.getItem(STORAGE_KEY); } catch (e) { saved = null; }
         var initial = saved || defaultLanguage;
         if (initial && initial !== cfg.sourceLanguage && langs.some(function (l) { return l.code === initial; })) {
-          setLanguage(initial);
+          setLanguage(initial, saved ? "remembered from the visitor's last choice" : "data-default-language");
+        } else {
+          log("Showing the original language. Waiting for the visitor to choose.");
         }
       })
       .catch(function (err) {
-        console.warn("[WebLingo] Widget disabled:", err && err.message ? err.message : err);
+        logError("Widget disabled: " + (err && err.message ? err.message : err) +
+          ". Check the project key and that this site's domain is authorized in the WebLingo dashboard.");
       });
   }
 

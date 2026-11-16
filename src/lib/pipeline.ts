@@ -16,7 +16,8 @@
 
 import { db } from "@/db";
 import { auditEvents, pages, pageStrings, projects, sourceStrings, translationJobs, translations } from "@/db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { escapeSkeletonText, placeholdersMatch, skeletonHasPlaceholders } from "./segments";
 import type { ExtractionResult } from "./extractor";
 import {
   TranslationEngineError,
@@ -421,6 +422,151 @@ export async function runJobStep(
 
   const progress = (await getJobProgress(jobId))!;
   return { progress, translated, fromMemory, failedNow, durationMs: Date.now() - started, batchSize, nextBatchSize };
+}
+
+// ---------------------------------------------------------------------------
+// Browser-side translation (Chrome's built-in, on-device Translator API)
+//
+// The dashboard can translate in the user's own Chrome instead of on the
+// LibreTranslate server: it "claims" pending strings, translates them locally,
+// and posts the results back. The server validates every result exactly like
+// LibreTranslate output (non-empty, link placeholders intact). Anything the
+// browser cannot do is left pending for the normal LibreTranslate steps.
+// ---------------------------------------------------------------------------
+
+async function refreshJobStatus(jobId: number, userId: number | undefined, lastError: string | null) {
+  const job = await db.query.translationJobs.findFirst({ where: eq(translationJobs.id, jobId) });
+  if (!job) return;
+  const remaining = await countPending(job);
+  const failed = await countFailed(job);
+  const finished = remaining === 0;
+  const wasFinished = job.status === "completed" || job.status === "completed_with_errors";
+  await db
+    .update(translationJobs)
+    .set({
+      status: job.status === "failed" ? "failed" : finished ? (failed ? "completed_with_errors" : "completed") : "in_progress",
+      completedStrings: Math.max(0, job.totalStrings - remaining - failed),
+      errorMessage: lastError ?? job.errorMessage,
+      updatedAt: new Date(),
+    })
+    .where(eq(translationJobs.id, jobId));
+  if (finished && !wasFinished) {
+    if (job.pageId) {
+      await db
+        .update(pages)
+        .set({ translationStatus: failed ? "partial" : "translated", updatedAt: new Date() })
+        .where(eq(pages.id, job.pageId));
+    }
+    await db.insert(auditEvents).values({
+      projectId: job.projectId,
+      userId: userId ?? null,
+      eventType: "translation_job_completed",
+      details: { jobId, targetLanguage: job.targetLanguage, total: job.totalStrings, failed },
+    });
+  }
+}
+
+/**
+ * Hands the browser up to `limit` strings to translate: first fills what it
+ * can from translation memory, then returns the rest (skipping `excludeIds`,
+ * the strings the browser already could not translate).
+ */
+export async function claimForBrowser(
+  jobId: number,
+  opts: { limit: number; excludeIds: number[]; autoApprove: boolean; userId?: number }
+) {
+  const job = await db.query.translationJobs.findFirst({ where: eq(translationJobs.id, jobId) });
+  if (!job) throw new Error("Job not found.");
+  const project = await db.query.projects.findFirst({ where: eq(projects.id, job.projectId) });
+  if (!project) throw new Error("Project not found.");
+  const exclude = new Set(opts.excludeIds);
+  let fromMemory = 0;
+  let items: { id: number; source_text: string }[] = [];
+  if (job.status !== "completed" && job.status !== "completed_with_errors" && job.status !== "failed") {
+    const pending = await selectPending(job, Math.min(400, opts.limit + exclude.size + 100));
+    const memory = await lookupMemory(opts.userId, pending.map((p) => p.source_text), project.sourceLanguage, job.targetLanguage);
+    const hits = pending.filter((p) => memory.has(p.source_text));
+    await saveTranslations(
+      hits.map((h) => ({
+        stringId: h.id,
+        text: memory.get(h.source_text)!,
+        status: opts.autoApprove ? "approved" : "draft",
+        model: "translation-memory",
+      })),
+      job.targetLanguage
+    );
+    fromMemory = hits.length;
+    if (hits.length) await refreshJobStatus(jobId, opts.userId, null);
+    const hitIds = new Set(hits.map((h) => h.id));
+    items = pending.filter((p) => !hitIds.has(p.id) && !exclude.has(p.id)).slice(0, opts.limit);
+  }
+  return {
+    sourceLanguage: project.sourceLanguage,
+    targetLanguage: job.targetLanguage,
+    fromMemory,
+    items: items.map((i) => ({ stringId: i.id, sourceText: i.source_text })),
+    progress: (await getJobProgress(jobId))!,
+  };
+}
+
+/**
+ * Saves translations produced in the browser. `text` is plain text for
+ * segments without placeholders, or the translated skeleton for segments with
+ * <gN> placeholders. Invalid results are rejected (left pending for
+ * LibreTranslate), never saved.
+ */
+export async function saveBrowserResults(
+  jobId: number,
+  results: { stringId: number; text: string }[],
+  opts: { autoApprove: boolean; userId?: number; engine: string }
+) {
+  const job = await db.query.translationJobs.findFirst({ where: eq(translationJobs.id, jobId) });
+  if (!job) throw new Error("Job not found.");
+  const project = await db.query.projects.findFirst({ where: eq(projects.id, job.projectId) });
+  if (!project) throw new Error("Project not found.");
+  const ids = results.map((r) => r.stringId).filter((n) => Number.isInteger(n));
+  if (!ids.length) return { accepted: 0, rejected: [] as number[], progress: (await getJobProgress(jobId))! };
+
+  const sources = await db
+    .select({ id: sourceStrings.id, sourceText: sourceStrings.sourceText })
+    .from(sourceStrings)
+    .where(and(eq(sourceStrings.projectId, job.projectId), inArray(sourceStrings.id, ids)));
+  const byId = new Map<number, string>(sources.map((s: { id: number; sourceText: string }) => [s.id, s.sourceText]));
+
+  const ok: { stringId: number; text: string; status: string; model: string }[] = [];
+  const memoryRows: { sourceText: string; translatedText: string }[] = [];
+  const rejected: number[] = [];
+  for (const r of results) {
+    const source = byId.get(r.stringId);
+    const raw = typeof r.text === "string" ? r.text.trim() : "";
+    if (!source || !raw || raw.length > 20000) {
+      rejected.push(r.stringId);
+      continue;
+    }
+    let skeleton: string;
+    if (skeletonHasPlaceholders(source)) {
+      if (!placeholdersMatch(source, raw)) {
+        rejected.push(r.stringId);
+        continue;
+      }
+      skeleton = raw;
+    } else {
+      // Plain text from the browser: escape it into skeleton form; reject markup.
+      if (/<\/?[a-z][^>]*>/i.test(raw)) {
+        rejected.push(r.stringId);
+        continue;
+      }
+      skeleton = escapeSkeletonText(raw);
+    }
+    ok.push({ stringId: r.stringId, text: skeleton, status: opts.autoApprove ? "approved" : "draft", model: opts.engine });
+    memoryRows.push({ sourceText: source, translatedText: skeleton });
+  }
+  await saveTranslations(ok, job.targetLanguage);
+  await saveMemory(opts.userId, memoryRows, project.sourceLanguage, job.targetLanguage).catch((err) =>
+    console.error("[pipeline] memory save failed", err)
+  );
+  await refreshJobStatus(jobId, opts.userId, null);
+  return { accepted: ok.length, rejected, progress: (await getJobProgress(jobId))! };
 }
 
 /** Segments of one page with their translation for a language (for the results table). */

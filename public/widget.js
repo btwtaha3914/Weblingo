@@ -54,6 +54,9 @@
   var observeChanges = attr("data-observe", "true") !== "false";
   var reportMissing = attr("data-report-missing", "true") !== "false";
   var debug = attr("data-debug", "true") !== "false";
+  // Fill text that has no approved translation with Chrome's built-in,
+  // on-device translator (desktop Chrome 138+, HTTPS only). data-instant="false" disables.
+  var instant = attr("data-instant", "true") !== "false";
 
   // ---------------------------------------------------------------------------
   // Console logging: every widget action is logged with a [WebLingo] prefix so
@@ -426,14 +429,14 @@
 
   /** Translates the segments under root; returns { found, applied, missing } counts. */
   function translateRoot(root) {
-    var stats = { found: 0, applied: 0, missing: 0 };
+    var stats = { found: 0, applied: 0, missing: 0, missingSegs: [] };
     if (!currentDict) return stats;
     var segments = collectSegments(root);
     stats.found = segments.length;
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
       var translated = currentDict[sha256(seg.skeleton)];
-      if (!translated) { missing[seg.skeleton] = true; stats.missing++; continue; }
+      if (!translated) { missing[seg.skeleton] = true; stats.missing++; stats.missingSegs.push(seg); continue; }
       stats.applied++;
       if (seg.kind === "attr") {
         var original = seg.el.getAttribute(seg.name);
@@ -508,15 +511,17 @@
         flushTimer = null;
         var roots = Array.from(pendingRoots);
         pendingRoots.clear();
-        var applied = 0, notFound = 0;
+        var applied = 0, notFound = 0, missingSegs = [];
         paused(function () {
           for (var r = 0; r < roots.length; r++) {
             if (!roots[r].isConnected) continue;
             var st = translateRoot(roots[r]);
             applied += st.applied;
             notFound += st.missing;
+            missingSegs = missingSegs.concat(st.missingSegs);
           }
         });
+        if (missingSegs.length && currentLang) fillInstantly(currentLang, missingSegs, switchToken);
         if (applied || notFound) {
           log("New content appeared on the page: translated " + applied + " text item(s)" + (notFound ? ", " + notFound + " without a translation yet" : "") + ".");
         }
@@ -603,6 +608,88 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Instant fill-in with Chrome's on-device Translator API
+  // ---------------------------------------------------------------------------
+  var chromeTranslators = {};   // lang -> Promise<translator|null>
+  var instantCache = {};        // lang -> { skeleton: translation }
+
+  function chromeApi() {
+    return instant && typeof self !== "undefined" && "Translator" in self && self.isSecureContext ? self.Translator : null;
+  }
+  function chromeCode(code) {
+    var c = code.toLowerCase();
+    return c === "zh-tw" ? "zh-Hant" : c === "pt-br" ? "pt" : c === "nb" ? "no" : c;
+  }
+  function timeout(p, ms, fallback) {
+    return Promise.race([p.catch(function () { return fallback; }), new Promise(function (r) { setTimeout(function () { r(fallback); }, ms); })]);
+  }
+  /** Starts creating the translator; call it straight from the visitor's click (model downloads need one). */
+  function prepareInstant(lang) {
+    var T = chromeApi();
+    if (!T || !config || lang === config.sourceLanguage || chromeTranslators[lang]) return;
+    var opts = { sourceLanguage: chromeCode(config.sourceLanguage), targetLanguage: chromeCode(lang) };
+    var p;
+    try { p = T.create(opts).catch(function () { return null; }); } catch (e) { p = Promise.resolve(null); }
+    chromeTranslators[lang] = timeout(
+      timeout(T.availability(opts), 4000, "unavailable").then(function (a) {
+        if (a === "unavailable") return null;
+        if (a !== "available") log("Chrome is downloading its " + langLabel(lang) + " model for instant translation (first time only)…");
+        return p;
+      }),
+      60000,
+      null
+    );
+  }
+  function sameTags(source, translated) {
+    var tags = function (x) { return (x.match(/<\/?g\d+>/g) || []).sort().join(","); };
+    return tags(source) === tags(translated) && !/<(?!\/?g\d+>)[a-z\/!]/i.test(translated);
+  }
+  /** Translates segments that have no approved translation, on this device, then applies them. */
+  function fillInstantly(lang, segs, token) {
+    if (!segs.length || !chromeApi()) return Promise.resolve();
+    prepareInstant(lang);
+    var started = performance.now();
+    return chromeTranslators[lang].then(function (tr) {
+      if (!tr) { log("Instant translation into " + langLabel(lang) + " is not available in this browser; " + segs.length + " item(s) stay in the original language."); return; }
+      var cache = instantCache[lang] || (instantCache[lang] = {});
+      var done = [];
+      var chain = Promise.resolve();
+      segs.forEach(function (seg) {
+        chain = chain.then(function () {
+          if (token !== switchToken || currentLang !== lang) return;
+          if (cache[seg.skeleton]) { done.push({ seg: seg, text: cache[seg.skeleton] }); return; }
+          var tagged = /<g\d+>/.test(seg.skeleton);
+          var input = tagged ? seg.skeleton : unescapeText(seg.skeleton);
+          return timeout(tr.translate(input), 15000, "").then(function (out) {
+            out = (out || "").trim();
+            if (!out || (tagged && !sameTags(seg.skeleton, out))) return;
+            var text = tagged ? out : escapeText(out);
+            cache[seg.skeleton] = text;
+            done.push({ seg: seg, text: text });
+          });
+        });
+      });
+      return chain.then(function () {
+        if (token !== switchToken || currentLang !== lang || !done.length) return;
+        paused(function () {
+          done.forEach(function (d) {
+            var seg = d.seg;
+            if (seg.kind === "attr") {
+              if (!seg.el.isConnected) return;
+              var value = unescapeText(d.text);
+              attrRecords.push({ el: seg.el, name: seg.name, original: seg.el.getAttribute(seg.name), translated: value });
+              seg.el.setAttribute(seg.name, value);
+            } else if (seg.nodes.length && seg.nodes[0].parentNode === seg.container) {
+              applyRun(seg, d.text);
+            }
+          });
+        });
+        log("Instantly translated " + done.length + " of " + segs.length + " item(s) without an approved translation, using Chrome on this device (" + since(started) + "). These are not reviewed.");
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Language switching
   // ---------------------------------------------------------------------------
   var config = null;
@@ -655,6 +742,7 @@
             " text items" + (stats.missing ? " (" + stats.missing + " have no approved translation yet and stay in the original language)" : "") +
             ". Direction: " + (data.isRtl ? "right-to-left" : "left-to-right") + "."
         );
+        if (stats.missingSegs.length) fillInstantly(lang, stats.missingSegs, token);
       }
       try { localStorage.setItem(STORAGE_KEY, lang); } catch (e) { /* storage unavailable */ }
       ui.setCurrent(lang);
@@ -774,6 +862,7 @@
     }
     function choose(i) {
       log("Visitor chose " + options[i].lang.name + " (" + options[i].lang.code + ").");
+      prepareInstant(options[i].lang.code);
       close(true);
       setLanguage(options[i].lang.code, "chosen by the visitor");
     }

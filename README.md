@@ -128,9 +128,30 @@ Optional attributes:
 | `data-theme` | `auto` | `light`, `dark`, `auto` |
 | `data-observe` | `true` | Translate content added later by JavaScript |
 | `data-report-missing` | `true` | Report untranslated text seen on the live page to the dashboard |
+| `data-instant` | `true` | Fill text that has no approved translation with Chrome's on-device translator (desktop Chrome, HTTPS pages) |
+| `data-debug` | `true` | Log every widget action to the browser console (errors are always logged) |
 
 The chosen language is remembered across pages. JavaScript API:
 `WebLingo.setLanguage("ar")`, `WebLingo.getLanguage()`.
+
+## Faster translation with Chrome's built-in translator
+
+Chrome's right-click **Translate** is Google Translate inside the browser;
+websites cannot call it. Desktop Chrome 138+ also ships the
+[Translator API](https://developer.chrome.com/docs/ai/translator-api): a free
+translator that runs on the computer itself and that web pages *can* use.
+WebLingo uses it in two places, always with LibreTranslate as the fallback:
+
+| Where | What happens | Fallback |
+| --- | --- | --- |
+| Dashboard, Engine "Chrome on this computer first" (default) | Pending strings are translated in your Chrome, checked by the server (not empty, links kept) and saved like any other translation (`POST /api/jobs/:id/claim`, `POST /api/jobs/:id/results`) | Languages Chrome doesn't offer, strings where it drops a link, or no answer within 4 s go to LibreTranslate |
+| Widget on the client's site | Text with no approved translation is translated on the visitor's computer when they switch language | Other browsers, phones and plain-HTTP sites keep the original text for those items |
+
+Requirements and limits: HTTPS pages only (the dashboard on Netlify qualifies;
+a site on plain `http://` does not), and a one-time model download per language,
+which Chrome only starts right after a click. Instant widget translations are
+not reviewed or saved; they are still reported so they can be translated and
+approved in the dashboard.
 
 The project key is a **public** identifier, like a publishable key: it only
 reads approved translations. No LibreTranslate address or secret is ever sent

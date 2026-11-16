@@ -1,6 +1,8 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useSyncExternalStore } from "react";
+
+const noopSubscribe = () => () => {};
 import { LanguageMultiSelect } from "@/components/LanguageMultiSelect";
 import {
   JobState,
@@ -11,6 +13,12 @@ import {
   skeletonToDisplay,
   usePublicAppOrigin,
 } from "@/lib/client-utils";
+import {
+  PreparedTranslator,
+  chromeTranslatorSupported,
+  prepareChromeTranslators,
+  translateJobInBrowser,
+} from "@/lib/chrome-translator";
 
 interface Language {
   code: string;
@@ -102,6 +110,24 @@ export function QuickTranslateBar({
     authorized: false,
   });
   const abortRef = useRef<AbortController | null>(null);
+  // Chrome's on-device translator: "auto" = use it when this browser has it, then LibreTranslate.
+  const [engine, setEngine] = useState<"auto" | "server">("auto");
+  // Read after hydration (false on the server) without a setState-in-effect.
+  const chromeSupported = useSyncExternalStore(noopSubscribe, chromeTranslatorSupported, () => false);
+  const chromeRef = useRef<Map<string, PreparedTranslator> | null>(null);
+  const chromeCounts = useRef<Record<string, number>>({});
+  /** Must run inside the click handler, before any await (Chrome needs the click to download a model). */
+  const prepareChrome = (langs: string[]) => {
+    chromeCounts.current = {};
+    chromeRef.current =
+      engine === "auto" && chromeSupported
+        ? prepareChromeTranslators("en", langs, (lang, fraction) =>
+            setLangJobs((prev) =>
+              prev.map((x) => (x.lang === lang ? { ...x, note: `Downloading Chrome's language model… ${Math.round(fraction * 100)}%` } : x))
+            )
+          )
+        : null;
+  };
   // Pages of the last run, used by "Retry failed languages".
   const [lastPageIds, setLastPageIds] = useState<number[]>([]);
 
@@ -210,6 +236,22 @@ export function QuickTranslateBar({
             job = created.jobs[0];
           }
           show(null, pi);
+          // 1) Chrome's on-device translator in this browser (fast, free), when available.
+          const prepared = chromeRef.current?.get(lang);
+          if (prepared && job.total > 0) {
+            const status = await prepared.availability;
+            if (status !== "unavailable") {
+              if (status !== "available") {
+                setLangJobs((prev) => prev.map((x) => (x.lang === lang ? { ...x, note: "Downloading Chrome's language model (first time only)…" } : x)));
+              }
+              const tr = await prepared.translator;
+              if (tr) {
+                const r = await translateJobInBrowser(job.id, tr, { signal, onProgress: (s) => show(s, pi) });
+                chromeCounts.current[lang] = (chromeCounts.current[lang] || 0) + r.translated;
+              }
+            }
+          }
+          // 2) LibreTranslate on the server for everything else.
           const final = await runJobToCompletion(job.id, { signal, onProgress: (s) => show(s, pi) });
           if (final.status === "failed") throw new Error(final.lastError || "Translation failed.");
           done += final.done;
@@ -240,7 +282,12 @@ export function QuickTranslateBar({
                 ...x,
                 state: finalState,
                 error: allFailed ? errors[0] : undefined,
-                note: errors.length && !allFailed ? `${errors.length} page(s) failed` : undefined,
+                note:
+                  errors.length && !allFailed
+                    ? `${errors.length} page(s) failed`
+                    : chromeCounts.current[lang]
+                      ? `${chromeCounts.current[lang]} translated by Chrome on this computer, the rest by LibreTranslate or memory`
+                      : undefined,
               }
             : x
         )
@@ -281,7 +328,10 @@ export function QuickTranslateBar({
 
   /** Re-runs only the languages that failed or have failed strings; finished work is kept. */
   const retryFailed = async () => {
-    const langs = langJobs.filter((lj) => lj.error || lj.note || (lj.state && lj.state.failed > 0)).map((lj) => lj.lang);
+    const langs = langJobs
+      .filter((lj) => lj.error || (lj.note && /page(s) failed/.test(lj.note)) || (lj.state && lj.state.failed > 0))
+      .map((lj) => lj.lang);
+    prepareChrome(langs);
     if (!langs.length || !projectId || !lastPageIds.length) return;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -307,6 +357,7 @@ export function QuickTranslateBar({
       return;
     }
     const langs = [...targetLangs];
+    prepareChrome(langs);
     const controller = new AbortController();
     abortRef.current = controller;
     const signal = controller.signal;
@@ -544,7 +595,26 @@ export function QuickTranslateBar({
                 />
               </label>
             )}
+            <label className="flex items-center gap-2">
+              Engine
+              <select
+                value={engine}
+                onChange={(e) => setEngine(e.target.value as "auto" | "server")}
+                disabled={running}
+                className="px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-700"
+              >
+                <option value="auto">Chrome on this computer first, then LibreTranslate</option>
+                <option value="server">LibreTranslate server only</option>
+              </select>
+            </label>
           </div>
+          {engine === "auto" && (
+            <p className="text-xs text-slate-500">
+              {chromeSupported
+                ? "Chrome's built-in translator runs on this computer: free and usually much faster. Languages it does not offer, and sentences where it would drop a link, go to LibreTranslate automatically. The first time, Chrome downloads a model for each language."
+                : "Chrome's built-in translator is not available in this browser (it needs desktop Chrome 138 or newer on an HTTPS page), so LibreTranslate is used."}
+            </p>
+          )}
         </form>
 
         {stages && (

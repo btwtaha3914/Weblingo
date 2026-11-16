@@ -75,7 +75,7 @@ export function QuickTranslateBar({
     defaultLanguages && defaultLanguages.length ? defaultLanguages.slice(0, 10) : ["es", "ar", "ur"]
   );
   const [languages, setLanguages] = useState<Language[]>(FALLBACK_LANGUAGES);
-  const [langJobs, setLangJobs] = useState<{ lang: string; id: number; state: JobState | null; error?: string }[]>([]);
+  const [langJobs, setLangJobs] = useState<{ lang: string; id: number; state: JobState | null; error?: string; note?: string; frac?: number }[]>([]);
   const [rowsByLang, setRowsByLang] = useState<Record<string, ResultRow[]>>({});
   const [resultLang, setResultLang] = useState<string>("es");
   const [engineOnline, setEngineOnline] = useState<boolean | null>(null);
@@ -102,9 +102,8 @@ export function QuickTranslateBar({
     authorized: false,
   });
   const abortRef = useRef<AbortController | null>(null);
-  const currentPageRef = useRef<number | null>(null);
-  // Page of the last single-page run (null for whole-site runs), used by "Retry failed languages".
-  const [lastPageId, setLastPageId] = useState<number | null>(null);
+  // Pages of the last run, used by "Retry failed languages".
+  const [lastPageIds, setLastPageIds] = useState<number[]>([]);
 
   useEffect(() => {
     fetch("/api/languages")
@@ -144,81 +143,153 @@ export function QuickTranslateBar({
 
   const cancel = () => abortRef.current?.abort();
 
-  type CreatedJob = { id: number; total: number; targetLanguage: string; pageId?: number | null };
-  const pageIdOf = (jobs: CreatedJob[]) => jobs.find((j) => j.pageId)?.pageId ?? currentPageRef.current;
+  type CreatedJob = { id: number; total: number; targetLanguage: string };
+  type LangResult = { lang: string; done: number; failed: number; total: number; error?: string; partial?: string };
+
+  const mergeRows = (prev: Record<string, ResultRow[]>, lang: string, rows: ResultRow[]) => {
+    const seen = new Set((prev[lang] || []).map((r) => r.stringId));
+    return { ...prev, [lang]: [...(prev[lang] || []), ...rows.filter((r) => !seen.has(r.stringId))] };
+  };
 
   /**
-   * Runs language jobs one after another (LibreTranslate is CPU-bound, so
-   * parallel requests would not be faster), updating per-language progress.
+   * Translates the given pages into each language, one language and one page
+   * at a time (LibreTranslate is CPU-bound, so parallel requests would not be
+   * faster). Text shared by several pages (navigation, footer…) is translated
+   * once: later pages only send what is still missing.
    */
-  const runLanguageJobs = async (jobs: CreatedJob[], signal: AbortSignal, withRows: boolean) => {
-    const results: { lang: string; job: JobState | null; error?: string }[] = [];
-    for (let i = 0; i < jobs.length; i++) {
-      const j = jobs[i];
-      const label = `${langName(j.targetLanguage)} (${i + 1} of ${jobs.length})`;
-      stage("translate", "active", j.total ? `${label}: 0 / ${j.total} strings` : `${label}: already translated`);
-      try {
-        const finalJob = await runJobToCompletion(j.id, {
-          signal,
-          onProgress: (s) => {
-            setJob(s);
-            setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: s, error: undefined } : x)));
-            stage("translate", "active", `${label}: ${s.done} / ${s.total} strings${s.failed ? ` (${s.failed} failed)` : ""}`);
-          },
-        });
-        setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, state: finalJob, error: undefined } : x)));
-        if (finalJob.status === "failed") throw new Error(finalJob.lastError || "Translation failed.");
-        results.push({ lang: j.targetLanguage, job: finalJob });
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        setLangJobs((prev) => prev.map((x) => (x.id === j.id ? { ...x, error: msg } : x)));
-        results.push({ lang: j.targetLanguage, job: null, error: msg });
+  const translatePages = async (
+    pageIds: number[],
+    langs: string[],
+    signal: AbortSignal,
+    precreated?: CreatedJob[]
+  ): Promise<LangResult[]> => {
+    setLangJobs((prev) => {
+      const next = [...prev];
+      for (const lang of langs) {
+        const entry = { lang, id: 0, state: null as JobState | null };
+        const i = next.findIndex((x) => x.lang === lang);
+        if (i >= 0) next[i] = entry;
+        else next.push(entry);
       }
-      if (withRows) {
-        const res = await fetch(`/api/jobs/${j.id}?strings=1`, { signal });
-        const data = await res.json();
-        if (res.ok && Array.isArray(data.strings)) setRowsByLang((prev) => ({ ...prev, [j.targetLanguage]: data.strings }));
+      return next;
+    });
+    const results: LangResult[] = [];
+    for (let li = 0; li < langs.length; li++) {
+      const lang = langs[li];
+      let done = 0;
+      let failed = 0;
+      let total = 0;
+      const errors: string[] = [];
+      const pageLabel = (pi: number) => (pageIds.length > 1 ? `page ${pi + 1} of ${pageIds.length}` : "");
+      const show = (s: JobState | null, pi: number) => {
+        const state: JobState = {
+          id: 0,
+          status: "in_progress",
+          total: total + (s?.total ?? 0),
+          done: done + (s?.done ?? 0),
+          failed: failed + (s?.failed ?? 0),
+          remaining: s?.remaining ?? 0,
+          lastError: s?.lastError ?? null,
+        };
+        setJob(state);
+        const frac = (pi + (s && s.total > 0 ? (s.done + s.failed) / s.total : 0)) / pageIds.length;
+        setLangJobs((prev) => prev.map((x) => (x.lang === lang ? { ...x, state, error: undefined, note: pageLabel(pi), frac } : x)));
+        const where = [`${langName(lang)} (${li + 1} of ${langs.length})`, pageLabel(pi)].filter(Boolean).join(", ");
+        stage("translate", "active", `${where}: ${state.done} / ${state.total} strings${state.failed ? ` (${state.failed} failed)` : ""}`);
+      };
+      for (let pi = 0; pi < pageIds.length; pi++) {
+        if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
+        try {
+          let job = pi === 0 ? precreated?.find((j) => j.targetLanguage === lang) : undefined;
+          if (!job) {
+            const created = await postJSON<{ jobs: CreatedJob[] }>(
+              "/api/jobs",
+              { projectId, pageId: pageIds[pi], targetLanguages: [lang] },
+              signal
+            );
+            job = created.jobs[0];
+          }
+          show(null, pi);
+          const final = await runJobToCompletion(job.id, { signal, onProgress: (s) => show(s, pi) });
+          if (final.status === "failed") throw new Error(final.lastError || "Translation failed.");
+          done += final.done;
+          failed += final.failed;
+          total += final.total;
+          const res = await fetch(`/api/jobs/${job.id}?strings=1`, { signal });
+          const data = await res.json();
+          if (res.ok && Array.isArray(data.strings)) setRowsByLang((prev) => mergeRows(prev, lang, data.strings));
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") throw err;
+          errors.push(`${pageLabel(pi) ? `${pageLabel(pi)}: ` : ""}${err instanceof Error ? err.message : String(err)}`);
+        }
       }
+      const allFailed = errors.length === pageIds.length;
+      const finalState: JobState = {
+        id: 0,
+        status: errors.length || failed ? "completed_with_errors" : "completed",
+        total,
+        done,
+        failed,
+        remaining: 0,
+        lastError: errors[0] ?? null,
+      };
+      setLangJobs((prev) =>
+        prev.map((x) =>
+          x.lang === lang
+            ? {
+                ...x,
+                state: finalState,
+                error: allFailed ? errors[0] : undefined,
+                note: errors.length && !allFailed ? `${errors.length} page(s) failed` : undefined,
+              }
+            : x
+        )
+      );
+      results.push({
+        lang,
+        done,
+        failed,
+        total,
+        error: allFailed ? errors[0] : undefined,
+        partial: errors.length && !allFailed ? errors.join("; ") : undefined,
+      });
     }
-    const allOk = results.every((r) => r.job && !r.job.failed && !r.error);
+    const allOk = results.every((r) => !r.error && !r.partial && !r.failed);
     stage(
       "translate",
       allOk ? "done" : "error",
       results
-        .map((r) => `${langName(r.lang)}: ${r.error ? "failed" : `${r.job!.done}/${r.job!.total}${r.job!.failed ? `, ${r.job!.failed} failed` : ""}`}`)
+        .map((r) => `${langName(r.lang)}: ${r.error ? "failed" : `${r.done}/${r.total}${r.failed ? `, ${r.failed} failed` : ""}${r.partial ? ", some pages failed" : ""}`}`)
         .join(" · ")
     );
     return results;
   };
 
+  const reportResults = (results: LangResult[]) => {
+    const problems = results.filter((r) => r.error || r.partial);
+    if (problems.length === results.length && results.every((r) => r.error)) {
+      throw new Error(problems.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n"));
+    }
+    if (problems.length) {
+      setWarning(
+        `Some translations could not be completed. Use “Retry failed languages” to try them again:\n${problems
+          .map((f) => `${langName(f.lang)}: ${f.error || f.partial}`)
+          .join("\n")}`
+      );
+    }
+  };
+
   /** Re-runs only the languages that failed or have failed strings; finished work is kept. */
   const retryFailed = async () => {
-    const langs = langJobs.filter((lj) => lj.error || (lj.state && lj.state.failed > 0)).map((lj) => lj.lang);
-    if (!langs.length || !projectId) return;
+    const langs = langJobs.filter((lj) => lj.error || lj.note || (lj.state && lj.state.failed > 0)).map((lj) => lj.lang);
+    if (!langs.length || !projectId || !lastPageIds.length) return;
     const controller = new AbortController();
     abortRef.current = controller;
     setRunning(true);
     setError(null);
     setWarning(null);
     try {
-      const created = await postJSON<{ jobs: CreatedJob[] }>(
-        "/api/jobs",
-        { projectId, targetLanguages: langs, pageId: lastPageId ?? undefined },
-        controller.signal
-      );
-      // Replace the failed entries with the new jobs, keep the successful ones.
-      setLangJobs((prev) =>
-        prev.map((lj) => {
-          const nj = created.jobs.find((j) => j.targetLanguage === lj.lang);
-          return nj ? { lang: lj.lang, id: nj.id, state: null } : lj;
-        })
-      );
-      const results = await runLanguageJobs(created.jobs, controller.signal, lastPageId !== null);
-      const stillFailed = results.filter((r) => r.error);
-      if (stillFailed.length) {
-        setWarning(`Still failing:\n${stillFailed.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n")}`);
-      }
+      reportResults(await translatePages(lastPageIds, langs, controller.signal));
     } catch (err) {
       const aborted = err instanceof DOMException && err.name === "AbortError";
       setError(aborted ? "Cancelled. Translations finished so far are saved." : err instanceof Error ? err.message : String(err));
@@ -260,7 +331,8 @@ export function QuickTranslateBar({
     let current: StageKey = "connect";
 
     try {
-      let jobs: { id: number; total: number; targetLanguage: string }[];
+      let pageIds: number[];
+      let precreated: CreatedJob[] | undefined;
       if (!wholeSite) {
         const data = await postJSON<{
           page: { id: number; title: string; urlPath: string };
@@ -269,7 +341,6 @@ export function QuickTranslateBar({
           likelyClientRendered: boolean;
           jobs: { id: number; total: number; targetLanguage: string }[];
         }>("/api/translate-page", { url: url.trim(), projectId, targetLanguages: langs }, signal);
-        currentPageRef.current = data.page.id;
         stage("connect", "done", new URL(data.page.urlPath).host);
         stage("extract", "done", `${data.extractedCount} text items, ${data.uniqueCount} unique`);
         if (data.likelyClientRendered) setWarning("This page builds most of its content with JavaScript, so some text may be missing. Install the widget and visit the page: it reports text it finds, and you can translate it from the editor below.");
@@ -282,7 +353,8 @@ export function QuickTranslateBar({
           unique: data.uniqueCount,
           langs,
         });
-        jobs = data.jobs;
+        pageIds = [data.page.id];
+        precreated = data.jobs;
       } else {
         const first = await postJSON<{
           baseUrl: string;
@@ -296,16 +368,18 @@ export function QuickTranslateBar({
         stage("pages", "active", `0 / ${first.pages.length} more pages`);
         let unique = first.firstPage.uniqueCount;
         let okPages = 1;
+        const sitePageIds = [first.firstPage.id];
         const failures: string[] = [];
         for (let i = 0; i < first.pages.length; i++) {
           if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
           try {
-            const r = await postJSON<{ saved: { uniqueCount: number } | null }>(
+            const r = await postJSON<{ saved: { pageId: number; uniqueCount: number } | null }>(
               "/api/extract",
               { url: first.pages[i], projectId, saveToDatabase: true },
               signal
             );
             unique += r.saved?.uniqueCount ?? 0;
+            if (r.saved) sitePageIds.push(r.saved.pageId);
             okPages++;
           } catch (err) {
             if (err instanceof DOMException && err.name === "AbortError") throw err;
@@ -324,25 +398,12 @@ export function QuickTranslateBar({
           unique,
           langs,
         });
-        const created = await postJSON<{ jobs: { id: number; total: number; targetLanguage: string }[] }>(
-          "/api/jobs",
-          { projectId, targetLanguages: langs },
-          signal
-        );
-        jobs = created.jobs;
+        pageIds = sitePageIds;
       }
 
       current = "translate";
-      setLastPageId(wholeSite ? null : pageIdOf(jobs));
-      setLangJobs(jobs.map((j) => ({ lang: j.targetLanguage, id: j.id, state: null })));
-      const results = await runLanguageJobs(jobs, signal, !wholeSite);
-      const failedLangs = results.filter((r) => r.error);
-      if (failedLangs.length === results.length) {
-        throw new Error(failedLangs.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n"));
-      }
-      if (failedLangs.length) {
-        setWarning(`Some languages could not be translated. Use “Retry failed languages” to try them again:\n${failedLangs.map((f) => `${langName(f.lang)}: ${f.error}`).join("\n")}`);
-      }
+      setLastPageIds(pageIds);
+      reportResults(await translatePages(pageIds, langs, signal, precreated));
       stage("save", "done", "Approved translations saved");
       stage("script", "done", "Ready to install");
       onTranslationComplete?.();
@@ -521,10 +582,16 @@ export function QuickTranslateBar({
           <ul className="mt-4 grid gap-3 sm:grid-cols-2" aria-label="Progress per language">
             {langJobs.map((lj) => {
               const s = lj.state;
-              const p = s && s.total > 0 ? Math.round(((s.done + s.failed) / s.total) * 100) : s ? 100 : 0;
               const done = s && ["completed", "completed_with_errors"].includes(s.status);
+              const p = done
+                ? 100
+                : typeof lj.frac === "number"
+                  ? Math.round(lj.frac * 100)
+                  : s && s.total > 0
+                    ? Math.round(((s.done + s.failed) / s.total) * 100)
+                    : 0;
               return (
-                <li key={lj.id} className="p-3 rounded-xl border border-slate-200 bg-slate-50/60">
+                <li key={lj.lang} className="p-3 rounded-xl border border-slate-200 bg-slate-50/60">
                   <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
                     <span>{langName(lj.lang)}</span>
                     <span className={lj.error ? "text-red-600" : s?.failed ? "text-amber-700" : done ? "text-emerald-700" : "text-slate-500"}>
@@ -534,6 +601,7 @@ export function QuickTranslateBar({
                   <div className="mt-2 h-1.5 rounded-full bg-slate-200 overflow-hidden" role="progressbar" aria-label={langName(lj.lang)} aria-valuemin={0} aria-valuemax={100} aria-valuenow={p}>
                     <div className={`h-full transition-all duration-500 ${lj.error ? "bg-red-500" : s?.failed ? "bg-amber-500" : "bg-blue-600"}`} style={{ width: `${lj.error ? 100 : p}%` }} />
                   </div>
+                  {lj.note && !lj.error && <p className="mt-1 text-[11px] text-slate-500">{lj.note}</p>}
                   {lj.error && <p className="mt-1 text-[11px] text-red-700">{lj.error}</p>}
                 </li>
               );

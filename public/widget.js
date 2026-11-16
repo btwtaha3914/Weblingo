@@ -507,22 +507,35 @@
   }
 
   var dictCache = {};
+  function languageVersion(lang) {
+    var langs = (config && config.languages) || [];
+    for (var i = 0; i < langs.length; i++) if (langs[i].code === lang) return langs[i].version || "0";
+    return "0";
+  }
+  /**
+   * Language and version are part of the URL path, so every language (and
+   * every update) has its own cache entry at the CDN and in the browser.
+   */
   function loadDictionary(lang) {
-    if (dictCache[lang]) return Promise.resolve(dictCache[lang]);
-    var cacheKey = "weblingo:dict:" + projectKey + ":" + lang;
+    var version = languageVersion(lang);
+    var memKey = lang + "@" + version;
+    if (dictCache[memKey]) return Promise.resolve(dictCache[memKey]);
+    var cacheKey = "weblingo:dict:" + projectKey + ":" + memKey;
     try {
       var raw = sessionStorage.getItem(cacheKey);
       if (raw) {
         var parsed = JSON.parse(raw);
-        if (parsed && Date.now() - parsed.at < 5 * 60 * 1000) { dictCache[lang] = parsed.data; return Promise.resolve(parsed.data); }
+        if (parsed && parsed.targetLanguage === lang) { dictCache[memKey] = parsed; return Promise.resolve(parsed); }
       }
     } catch (e) { /* storage unavailable */ }
-    return getJSON(apiBase + "/api/widget/translations?key=" + encodeURIComponent(projectKey) + "&lang=" + encodeURIComponent(lang))
-      .then(function (data) {
-        dictCache[lang] = data;
-        try { sessionStorage.setItem(cacheKey, JSON.stringify({ at: Date.now(), data: data })); } catch (e) { /* quota */ }
-        return data;
-      });
+    var url = apiBase + "/api/widget/p/" + encodeURIComponent(projectKey) + "/t/" + encodeURIComponent(lang) + "/" + encodeURIComponent(version);
+    return getJSON(url).then(function (data) {
+      // Never apply a dictionary for a different language than requested.
+      if (data.targetLanguage !== lang) throw new Error("Received translations for '" + data.targetLanguage + "' instead of '" + lang + "'");
+      dictCache[memKey] = data;
+      try { sessionStorage.setItem(cacheKey, JSON.stringify(data)); } catch (e) { /* quota */ }
+      return data;
+    });
   }
 
   var reportTimer = null;
@@ -550,13 +563,17 @@
   // ---------------------------------------------------------------------------
   var config = null;
 
+  var switchToken = 0;
   function setLanguage(lang) {
     if (!config) return Promise.resolve();
     var isSource = lang === config.sourceLanguage;
     if ((isSource && currentLang === null) || lang === currentLang) return Promise.resolve();
+    var token = ++switchToken;
     ui.setBusy(true);
     var job = isSource ? Promise.resolve(null) : loadDictionary(lang);
     return job.then(function (data) {
+      // A newer choice was made while this one was loading: ignore this one.
+      if (token !== switchToken) return;
       paused(function () {
         restoreAll();
         currentDict = null;
@@ -575,9 +592,10 @@
       ui.setError("");
       scheduleMissingReport();
     }).catch(function (err) {
+      if (token !== switchToken) return;
       console.error("[WebLingo] Could not load translations:", err);
       ui.setError("Translation is unavailable right now.");
-    }).then(function () { ui.setBusy(false); });
+    }).then(function () { if (token === switchToken) ui.setBusy(false); });
   }
 
   // ---------------------------------------------------------------------------
@@ -725,7 +743,7 @@
   // Boot
   // ---------------------------------------------------------------------------
   function start() {
-    getJSON(apiBase + "/api/widget/config?key=" + encodeURIComponent(projectKey))
+    getJSON(apiBase + "/api/widget/p/" + encodeURIComponent(projectKey) + "/config")
       .then(function (cfg) {
         config = cfg;
         var langs = cfg.languages || [];
